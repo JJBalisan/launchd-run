@@ -28,6 +28,16 @@ and `launchctl bootout` + `bootstrap` that agent. Daily jobs suit `--after 2` (o
 network night is not news); weekly ones suit `--after 1`, since a missed weekly run is already
 a fortnight of drift by the time it happens twice.
 
+## Signals are not failures
+
+Exit codes 129, 130, 137 and 143 (SIGHUP, SIGINT, SIGKILL, SIGTERM) mean somebody stopped the
+job — a logout, a `launchctl kill`, a `KeepAlive` restart. Those are recorded and ignored: they
+neither raise the counter nor clear an existing streak. Crash signals (134 SIGABRT, 138 SIGBUS,
+139 SIGSEGV) still count.
+
+This matters for `KeepAlive` servers, which exit by signal in normal use. Without it, two
+ordinary restarts look identical to two crashes.
+
 ## Why a wrapper rather than a line in each script
 
 The jobs it guards are written in different languages and live in different places — a git

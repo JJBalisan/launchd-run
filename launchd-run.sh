@@ -48,6 +48,16 @@ elapsed=$(( $(date +%s) - started ))
 fails_file="$STATE/fail-count"
 prev=$(cat "$fails_file" 2>/dev/null || echo 0)
 
+# 129/130/137/143 are SIGHUP/SIGINT/SIGKILL/SIGTERM: somebody stopped the job -
+# a logout, a launchctl kill, a KeepAlive restart. That is not a failure, and it
+# must not reset a real failure streak either, so it is recorded and ignored.
+# Crash signals (134 SIGABRT, 138 SIGBUS, 139 SIGSEGV) still count.
+case "$code" in
+  129|130|137|143)
+    note "stopped by signal (exit $code, ${elapsed}s) - not counted"
+    exit "$code" ;;
+esac
+
 if [ "$code" -eq 0 ]; then
   rm -f "$fails_file"
   note "ok (${elapsed}s)"
