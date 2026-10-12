@@ -1,0 +1,36 @@
+# Google-style gate, from the shared toolchain (repo-audit-2026-10-05).
+# Install once per clone: `uvx pre-commit install`
+# No Python or JavaScript here, so the ruff and eslint hooks are left out.
+# shfmt runs with the flags the code is formatted with (no -sr: redirects
+# stay unspaced, as in the rest of the repo).
+repos:
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        args: [--severity=style]
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.12.0-2
+    hooks:
+      - id: shfmt
+        # Google shell guide: 2-space, case indent, binary ops at line start.
+        args: [-i, "2", -ci, -bn]
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.45.0
+    hooks:
+      - id: markdownlint
+        args: [--disable, MD013, --]   # line length handled by editorconfig
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: detect-private-key
+      - id: check-yaml
+      - id: check-json
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
