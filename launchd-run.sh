@@ -13,18 +13,34 @@
 # a single working script.
 set -uo pipefail
 
-LABEL="${1:-}"; shift || true
-[ -n "$LABEL" ] || { echo "usage: launchd-run.sh LABEL [--after N] -- cmd..." >&2; exit 64; }
+LABEL="${1:-}"
+shift || true
+[ -n "$LABEL" ] || {
+  echo "usage: launchd-run.sh LABEL [--after N] -- cmd..." >&2
+  exit 64
+}
 
 ALERT_AFTER=2
 while [ $# -gt 0 ]; do
   case "$1" in
-    --after) ALERT_AFTER="$2"; shift 2 ;;
-    --) shift; break ;;
-    *) echo "launchd-run: unexpected argument $1" >&2; exit 64 ;;
+    --after)
+      ALERT_AFTER="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "launchd-run: unexpected argument $1" >&2
+      exit 64
+      ;;
   esac
 done
-[ $# -gt 0 ] || { echo "launchd-run: no command given" >&2; exit 64; }
+[ $# -gt 0 ] || {
+  echo "launchd-run: no command given" >&2
+  exit 64
+}
 
 STATE="$HOME/.local/state/launchd-run/$LABEL"
 AUDIT="$HOME/Library/Logs/launchd-run.log"
@@ -43,7 +59,7 @@ notify() {
 started=$(date +%s)
 "$@"
 code=$?
-elapsed=$(( $(date +%s) - started ))
+elapsed=$(($(date +%s) - started))
 
 fails_file="$STATE/fail-count"
 prev=$(cat "$fails_file" 2>/dev/null || echo 0)
@@ -53,9 +69,10 @@ prev=$(cat "$fails_file" 2>/dev/null || echo 0)
 # must not reset a real failure streak either, so it is recorded and ignored.
 # Crash signals (134 SIGABRT, 138 SIGBUS, 139 SIGSEGV) still count.
 case "$code" in
-  129|130|137|143)
+  129 | 130 | 137 | 143)
     note "stopped by signal (exit $code, ${elapsed}s) - not counted"
-    exit "$code" ;;
+    exit "$code"
+    ;;
 esac
 
 if [ "$code" -eq 0 ]; then

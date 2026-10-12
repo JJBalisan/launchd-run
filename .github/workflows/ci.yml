@@ -6,8 +6,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install shellcheck
-        run: command -v shellcheck || brew install shellcheck
+      - name: Install shellcheck and shfmt
+        run: |
+          command -v shellcheck || brew install shellcheck
+          command -v shfmt || brew install shfmt
+      - name: Format (shfmt, Google shell guide flags)
+        run: shfmt -d -i 2 -ci -bn launchd-run.sh install.sh tests/run.sh
       - name: Shellcheck
         # SC2015 (info) is the notify() `a && b || c` chain that the audit's
         # P3 style pass turns into an if block; everything else must be clean.
