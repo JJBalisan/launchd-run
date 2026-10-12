@@ -35,7 +35,8 @@ JOB_EXIT=0
 #   Message words, joined with spaces.
 #######################################
 note() {
-  printf '%s  %-38s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${LABEL}" "$*" >>"${AUDIT}"
+  printf '%s  %-38s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${LABEL}" "$*" \
+    >>"${AUDIT}"
 }
 
 #######################################
@@ -50,7 +51,10 @@ note() {
 notify() {
   local subtitle="$1"
   local text="$2"
-  if osascript -e "display notification \"${text}\" with title \"launchd: ${LABEL}\" subtitle \"${subtitle}\"" >/dev/null 2>&1; then
+  local script
+  script="display notification \"${text}\""
+  script+=" with title \"launchd: ${LABEL}\" subtitle \"${subtitle}\""
+  if osascript -e "${script}" >/dev/null 2>&1; then
     note "alert sent: ${subtitle} - ${text}"
   else
     note "alert FAILED to send (osascript)"
@@ -145,7 +149,8 @@ main() {
     # One bad run can be a flaky network or a host mid-deploy; a pattern
     # cannot.
     if [ "${fails}" -ge "${alert_after}" ]; then
-      notify "Job failing" "exit ${code} on ${fails} consecutive runs - see the log"
+      notify "Job failing" \
+        "exit ${code} on ${fails} consecutive runs - see the log"
     fi
   fi
 

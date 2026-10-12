@@ -13,7 +13,8 @@ repos:
     rev: v3.12.0-2
     hooks:
       - id: shfmt
-        args: [-i, "2", -ci, -bn]   # Google shell guide: 2-space, case indent, binary ops at line start
+        # Google shell guide: 2-space, case indent, binary ops at line start.
+        args: [-i, "2", -ci, -bn]
   - repo: https://github.com/igorshubovych/markdownlint-cli
     rev: v0.45.0
     hooks:
