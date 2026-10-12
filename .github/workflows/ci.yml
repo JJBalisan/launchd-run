@@ -13,10 +13,8 @@ jobs:
       - name: Format (shfmt, Google shell guide flags)
         run: shfmt -d -i 2 -ci -bn launchd-run.sh install.sh tests/run.sh
       - name: Shellcheck
-        # SC2015 (info) is the notify() `a && b || c` chain that the audit's
-        # P3 style pass turns into an if block; everything else must be clean.
         run: |
-          shellcheck -e SC2015 launchd-run.sh
+          shellcheck launchd-run.sh
           shellcheck install.sh tests/run.sh
       - name: Tests (bash on PATH)
         run: bash tests/run.sh
