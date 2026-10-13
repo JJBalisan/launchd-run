@@ -1,6 +1,9 @@
 # Lint and test launchd-run on macOS, where it runs (bash 3.2, BSD tools).
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: macos-latest
