@@ -53,8 +53,8 @@ note() {
 
 #######################################
 # Raises a Notification Center banner and records the outcome in the audit log.
-# Banners are attributed to Script Editor. The text is interpolated into
-# AppleScript, so keep it free of double quotes.
+# Banners are attributed to Script Editor. The text reaches AppleScript as
+# argv rather than being spliced into the source, so any characters are fine.
 # Globals:
 #   LABEL
 # Arguments:
@@ -63,10 +63,11 @@ note() {
 notify() {
   local subtitle="$1"
   local text="$2"
-  local script
-  script="display notification \"${text}\""
-  script+=" with title \"launchd: ${LABEL}\" subtitle \"${subtitle}\""
-  if osascript -e "${script}" >/dev/null 2>&1; then
+  if osascript -e 'on run argv' \
+    -e 'set {msg, ttl, sub} to argv' \
+    -e 'display notification msg with title ttl subtitle sub' \
+    -e 'end run' -- "${text}" "launchd: ${LABEL}" "${subtitle}" \
+    >/dev/null 2>&1; then
     note "alert sent: ${subtitle} - ${text}"
   else
     note "alert FAILED to send (osascript)"

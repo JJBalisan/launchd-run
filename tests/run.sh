@@ -297,12 +297,9 @@ test_fail_threshold() {
   check 'fail 2: exit 3' rc_is 3
   check 'fail 2: counter 2' counter_is job 2
   check 'fail 2: at threshold, one banner' calls_are 1
-  check 'fail 2: banner subtitle "Job failing"' \
-    call_has 1 'subtitle "Job failing"'
-  check 'fail 2: banner text has exit code and streak' \
-    call_has 1 'exit 3 on 2 consecutive runs'
-  check 'fail 2: banner title names the label' \
-    call_has 1 'with title "launchd: job"'
+  check 'fail 2: banner text, title and subtitle passed as argv' \
+    call_has 1 \
+    '| exit 3 on 2 consecutive runs - see the log | launchd: job | Job failing'
   check 'fail 2: audit records alert sent' audit_has 'alert sent: Job failing'
 
   run_wrap job -- /bin/sh -c 'exit 5'
@@ -334,6 +331,18 @@ test_fail_threshold() {
   check 'labels: other label untouched' counter_is other 5
   check 'labels: no banner' calls_are 0
 
+  echo '# banner text is argv, so quotes in the label reach osascript intact'
+  new_case
+  seed_counter 'say "hi"' 1
+  run_wrap 'say "hi"' -- /bin/sh -c 'exit 3'
+  check 'quoted label: banner raised' calls_are 1
+  check 'quoted label: label reaches osascript verbatim' \
+    call_has 1 '| launchd: say "hi" | Job failing'
+  check 'quoted label: AppleScript takes its text from argv' \
+    call_has 1 'display notification msg with title ttl subtitle sub |'
+  check 'quoted label: audit records alert sent' \
+    audit_has 'alert sent: Job failing'
+
   echo '# osascript failure is logged, exit code unaffected'
   new_case
   seed_counter job 1
@@ -352,10 +361,9 @@ test_recovery() {
   check 'recovery: exit 0' rc_is 0
   check 'recovery: counter cleared' counter_absent job
   check 'recovery: one banner' calls_are 1
-  check 'recovery: subtitle "Back to normal"' \
-    call_has 1 'subtitle "Back to normal"'
-  check 'recovery: text names the streak' \
-    call_has 1 'succeeded after 2 failed runs'
+  check 'recovery: text, title and subtitle passed as argv' \
+    call_has 1 \
+    '| succeeded after 2 failed runs | launchd: job | Back to normal'
   run_wrap job -- /usr/bin/true
   check 'recovery: next success raises nothing' calls_are 1
 
