@@ -8,6 +8,11 @@
 # raises a Notification Center banner once it has failed N consecutive times
 # (default 2), re-raising every run it stays broken and once more on recovery.
 #
+# Under launchd the wrapper is the job's main process, so a stop (launchctl
+# kill, bootout, logout, a KeepAlive restart) signals the wrapper, not the
+# command. SIGHUP, SIGINT and SIGTERM are therefore forwarded to the command
+# as SIGTERM, and the stop is logged once the command has exited.
+#
 # Why a wrapper and not a line in each script: the jobs it guards are written in
 # different languages and live in different places (a git clone, a cloud mount,
 # another repo). Wrapping at the plist level guards all of them without editing
@@ -75,7 +80,7 @@ notify() {
 #######################################
 main() {
   local alert_after=2
-  local state fails_file prev fails started code elapsed
+  local state fails_file prev fails started pid stopped='' code elapsed
 
   LABEL="${1:-}"
   shift || true
@@ -112,8 +117,25 @@ main() {
   mkdir -p "${state}"
 
   started="$(date +%s)"
-  "$@"
+  # The job runs in the background so that a stop signal reaches the wrapper's
+  # trap instead of killing it outright. <&0 keeps stdin attached, which bash
+  # would otherwise replace with /dev/null for a background job. One side
+  # effect stays: bash starts a background job with SIGINT and SIGQUIT
+  # ignored, and the job inherits that; launchd only ever sends SIGTERM.
+  "$@" <&0 &
+  pid=$!
+  trap 'stopped=1; kill -TERM "${pid}" 2>/dev/null' HUP INT TERM
+  wait "${pid}"
   code=$?
+  if [[ -n "${stopped}" ]]; then
+    # The trap interrupted wait with 128+signal before the job had exited.
+    # Wait for the job itself and take its status whatever it is: a job that
+    # handles SIGTERM and exits 0 has stopped cleanly.
+    wait "${pid}"
+    code=$?
+  fi
+  # The job is done; a further stop must not cut the bookkeeping short.
+  trap '' HUP INT TERM
   JOB_EXIT="${code}"
   elapsed=$(($(date +%s) - started))
 

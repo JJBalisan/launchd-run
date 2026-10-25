@@ -41,6 +41,14 @@ count.
 This matters for `KeepAlive` servers, which exit by signal in normal use.
 Without it, two ordinary restarts look identical to two crashes.
 
+launchd stops a job by signalling its main process, which with the wrapper in
+front is the wrapper itself. The wrapper traps SIGHUP, SIGINT and SIGTERM,
+forwards SIGTERM to the command, waits for it to exit and then logs the stop
+(`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line and
+no orphaned command. A command that handles SIGTERM and exits 0 is logged as
+`ok`. One side effect: the command runs as a background job of the wrapper, so
+it starts with SIGINT and SIGQUIT ignored.
+
 ## Why a wrapper rather than a line in each script
 
 The jobs it guards are written in different languages and live in different

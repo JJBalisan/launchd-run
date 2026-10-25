@@ -501,48 +501,86 @@ test_bad_counter_file() {
   done
 }
 
-test_signal_to_wrapper() {
-  local job pidfile wpid wrc child=''
-  echo '# stop signal sent to the wrapper itself (launchctl kill, bootout)'
-  new_case
-  seed_counter svc 1
+#######################################
+# Starts the wrapper in the background around a job that records its own
+# pid, then sends the wrapper the given signal once the job is up. This is
+# what launchctl kill, bootout, logout and a KeepAlive restart do: the
+# signal lands on the wrapper, not on the job.
+# Globals:
+#   RC (set to the wrapper's exit status)
+#   CHILD (set to the job's pid, or empty if the job never started)
+# Arguments:
+#   Signal name, then the body of the job script (sh; $1 is the pid file).
+#######################################
+stop_wrapper_with() {
+  local sig="$1" body="$2" job pidfile wpid
   job="${CASE_DIR}/job.sh"
   pidfile="${CASE_DIR}/child.pid"
   # shellcheck disable=SC2016  # Expanded by the job script, not here.
-  printf '#!/bin/sh\necho $$ >"$1"\nexec /bin/sleep 30\n' >"${job}"
+  printf '#!/bin/sh\necho $$ >"$1"\n%s\n' "${body}" >"${job}"
   chmod +x "${job}"
 
-  # env execs the wrapper, so $! is the wrapper's own bash. SIGTERM, not
-  # SIGINT: a non-interactive shell starts async jobs with SIGINT ignored.
+  # env execs the wrapper, so $! is the wrapper's own bash. SIGINT is not
+  # tested: a non-interactive shell starts async jobs with SIGINT ignored,
+  # so the wrapper could neither receive nor trap it from here.
   env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
     OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
     "${WRAPPER}" svc -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
 
+  CHILD=''
   if ! wait_for_file "${pidfile}"; then
-    check 'wrapper started the job' false
     kill -KILL "${wpid}" 2>/dev/null
     wait "${wpid}" 2>/dev/null
-    return
+    return 1
   fi
-  child="$(cat "${pidfile}")"
-  leftover_pids="${leftover_pids} ${child}"
+  CHILD="$(cat "${pidfile}")"
+  leftover_pids="${leftover_pids} ${CHILD}"
+  # The job is up; give the wrapper a moment to reach its wait.
+  sleep 0.2
 
-  kill -TERM "${wpid}"
+  kill "-${sig}" "${wpid}"
   # The braces keep bash's "Terminated" job report out of the test output.
   { wait "${wpid}"; } 2>/dev/null
-  wrc=$?
-  RC="${wrc}"
+  RC=$?
+}
 
-  check 'SIGTERM to wrapper: exits 143' rc_is 143
-  check 'SIGTERM to wrapper: streak of 1 untouched' counter_is svc 1
-  check 'SIGTERM to wrapper: no banner' calls_are 0
-  known_fail 'SIGTERM to wrapper: stop recorded in the audit log' \
-    'audit P1 trap and forward HUP/INT/TERM' \
-    audit_has 'stopped by signal'
-  known_fail 'SIGTERM to wrapper: forwarded, job not orphaned' \
-    'audit P1 trap and forward HUP/INT/TERM' pid_gone "${child}"
+test_signal_to_wrapper() {
+  local sig
+  echo '# stop signal sent to the wrapper itself (launchctl kill, bootout)'
+  for sig in TERM HUP; do
+    new_case
+    seed_counter svc 1
+    if ! stop_wrapper_with "${sig}" 'exec /bin/sleep 30'; then
+      check "SIG${sig} to wrapper: wrapper started the job" false
+      continue
+    fi
+    check "SIG${sig} to wrapper: exits 143" rc_is 143
+    check "SIG${sig} to wrapper: streak of 1 untouched" counter_is svc 1
+    check "SIG${sig} to wrapper: no banner" calls_are 0
+    check "SIG${sig} to wrapper: stop recorded in the audit log" \
+      audit_has 'stopped by signal (exit 143'
+    check "SIG${sig} to wrapper: forwarded, job not orphaned" \
+      pid_gone "${CHILD}"
+    check "SIG${sig} to wrapper: no job-control noise on stderr" err_empty
+  done
+
+  echo '# job handles SIGTERM itself and exits 0: a clean stop'
+  new_case
+  seed_counter svc 1
+  # sleep runs in the background so sh can act on the trap at once, and the
+  # trap takes it down so the suite leaves nothing behind.
+  if ! stop_wrapper_with TERM \
+    "trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & wait \$!"; then
+    check 'clean stop: wrapper started the job' false
+    return
+  fi
+  check 'clean stop: job exit 0 passed through' rc_is 0
+  check 'clean stop: logged as ok' audit_has 'ok ('
+  check 'clean stop: streak cleared' counter_absent svc
+  check 'clean stop: no banner' calls_are 0
+  check 'clean stop: job gone' pid_gone "${CHILD}"
 }
 
 main() {
