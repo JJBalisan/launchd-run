@@ -9,10 +9,7 @@
 # on PATH and records each call to a file instead of raising a banner. Nothing
 # outside the temp directory is written, and no network is used.
 #
-# Assertions print "ok" or "FAIL". A KNOWN-FAIL pins a defect from the
-# 2026-10-05 repo audit that is not fixed yet: it does not fail the run, but if
-# it starts passing it prints XPASS and does fail the run (like a strict
-# xfail), so whoever lands the fix moves the case into the normal checks.
+# Assertions print "ok" or "FAIL".
 #
 # LAUNCHD_RUN_WRAPPER points the suite at another copy of the wrapper (used to
 # check that the tests catch deliberately broken copies). The default is the
@@ -31,7 +28,6 @@ readonly STUB_BIN="${TMP_ROOT}/bin"
 
 passes=0
 failures=0
-known_fails=0
 case_n=0
 leftover_pids=''
 
@@ -66,26 +62,6 @@ check() {
   else
     printf 'FAIL        %s\n' "${desc}"
     failures=$((failures + 1))
-  fi
-}
-
-#######################################
-# Records an assertion that is expected to fail because of a known defect.
-# A pass is reported as XPASS and counts as a failure.
-# Arguments:
-#   Description, defect reference, then the command that should succeed once
-#   the defect is fixed.
-#######################################
-known_fail() {
-  local desc="$1" defect="$2"
-  shift 2
-  if "$@"; then
-    printf 'XPASS       %s [%s] - fixed? move it to check\n' \
-      "${desc}" "${defect}"
-    failures=$((failures + 1))
-  else
-    printf 'KNOWN-FAIL  %s [%s]\n' "${desc}" "${defect}"
-    known_fails=$((known_fails + 1))
   fi
 }
 
@@ -192,6 +168,34 @@ audit_has() {
   grep -F -q -- "$1" "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
 }
 
+audit_lacks() { ! audit_has "$1"; }
+
+# Line N of the audit log contains the fixed string.
+audit_line_has() {
+  local line
+  line="$(sed -n "$1p" "${CASE_HOME}/Library/Logs/launchd-run.log")"
+  case "${line}" in
+    *"$2"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Nothing but the audit log sits in ~/Library/Logs (no temp file left over).
+logs_dir_has_only_audit() {
+  local n
+  n="$(find "${CASE_HOME}/Library/Logs" -mindepth 1 | wc -l | tr -d ' ')"
+  [ "${n}" -eq 1 ]
+}
+
+# Writes N audit-shaped lines (about 60 bytes each) as the case's log.
+seed_audit_lines() {
+  awk -v n="$1" 'BEGIN {
+    for (i = 1; i <= n; i++) {
+      printf "2026-01-01 00:00:00  seed%-34s line %05d\n", "", i
+    }
+  }' >"${CASE_HOME}/Library/Logs/launchd-run.log"
+}
+
 audit_lines_are() {
   local f="${CASE_HOME}/Library/Logs/launchd-run.log" n=0
   [ -f "${f}" ] && n="$(wc -l <"${f}" | tr -d ' ')"
@@ -199,7 +203,6 @@ audit_lines_are() {
 }
 
 err_has() { grep -F -q -- "$1" "${CASE_DIR}/err"; }
-err_lacks() { ! grep -F -q -- "$1" "${CASE_DIR}/err"; }
 err_empty() { [ ! -s "${CASE_DIR}/err" ]; }
 out_is() { [ "$(cat "${CASE_DIR}/out")" = "$1" ]; }
 path_absent() { [ ! -e "$1" ]; }
@@ -228,7 +231,7 @@ pid_gone() {
 # --- Cases. ------------------------------------------------------------------
 
 test_argument_errors() {
-  local marker
+  local marker value
   echo '# argument errors'
 
   new_case
@@ -272,21 +275,23 @@ test_argument_errors() {
 
   new_case
   run_wrap job --after
-  known_fail '--after with no value: exit 64 (today: unbound variable, 1)' \
-    'audit P2 validate --after' rc_is 64
-  known_fail '--after with no value: usage error on stderr' \
-    'audit P2 validate --after' err_has 'usage'
+  check '--after with no value: exit 64' rc_is 64
+  check '--after with no value: usage error on stderr' err_has 'usage'
 
-  new_case
-  run_wrap job --after abc -- /bin/sh -c 'exit 3'
-  known_fail '--after abc: rejected with exit 64' \
-    'audit P2 validate --after' rc_is 64
+  for value in abc 0 -1 1x ''; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    run_wrap job --after "${value}" -- /usr/bin/touch "${marker}"
+    check "--after '${value}': rejected with exit 64" rc_is 64
+    check "--after '${value}': usage error on stderr" err_has 'usage'
+    check "--after '${value}': command not run" path_absent "${marker}"
+    check "--after '${value}': no state written" state_dir_absent
+  done
 
   new_case
   seed_counter job 0
   run_wrap job --after 0 -- /usr/bin/true
-  known_fail '--after 0: no recovery banner on a clean success' \
-    'audit P2 validate --after' calls_are 0
+  check '--after 0: no recovery banner, command not run' calls_are 0
 }
 
 test_ok_no_streak() {
@@ -320,12 +325,9 @@ test_fail_threshold() {
   check 'fail 2: exit 3' rc_is 3
   check 'fail 2: counter 2' counter_is job 2
   check 'fail 2: at threshold, one banner' calls_are 1
-  check 'fail 2: banner subtitle "Job failing"' \
-    call_has 1 'subtitle "Job failing"'
-  check 'fail 2: banner text has exit code and streak' \
-    call_has 1 'exit 3 on 2 consecutive runs'
-  check 'fail 2: banner title names the label' \
-    call_has 1 'with title "launchd: job"'
+  check 'fail 2: banner text, title and subtitle passed as argv' \
+    call_has 1 \
+    '| exit 3 on 2 consecutive runs - see the log | launchd: job | Job failing'
   check 'fail 2: audit records alert sent' audit_has 'alert sent: Job failing'
 
   run_wrap job -- /bin/sh -c 'exit 5'
@@ -357,6 +359,18 @@ test_fail_threshold() {
   check 'labels: other label untouched' counter_is other 5
   check 'labels: no banner' calls_are 0
 
+  echo '# banner text is argv, so quotes in the label reach osascript intact'
+  new_case
+  seed_counter 'say "hi"' 1
+  run_wrap 'say "hi"' -- /bin/sh -c 'exit 3'
+  check 'quoted label: banner raised' calls_are 1
+  check 'quoted label: label reaches osascript verbatim' \
+    call_has 1 '| launchd: say "hi" | Job failing'
+  check 'quoted label: AppleScript takes its text from argv' \
+    call_has 1 'display notification msg with title ttl subtitle sub |'
+  check 'quoted label: audit records alert sent' \
+    audit_has 'alert sent: Job failing'
+
   echo '# osascript failure is logged, exit code unaffected'
   new_case
   seed_counter job 1
@@ -375,10 +389,9 @@ test_recovery() {
   check 'recovery: exit 0' rc_is 0
   check 'recovery: counter cleared' counter_absent job
   check 'recovery: one banner' calls_are 1
-  check 'recovery: subtitle "Back to normal"' \
-    call_has 1 'subtitle "Back to normal"'
-  check 'recovery: text names the streak' \
-    call_has 1 'succeeded after 2 failed runs'
+  check 'recovery: text, title and subtitle passed as argv' \
+    call_has 1 \
+    '| succeeded after 2 failed runs | launchd: job | Back to normal'
   run_wrap job -- /usr/bin/true
   check 'recovery: next success raises nothing' calls_are 1
 
@@ -461,8 +474,7 @@ test_bad_counter_file() {
   check 'empty counter, ok: exit 0' rc_is 0
   check 'empty counter, ok: counter removed' counter_absent job
   check 'empty counter, ok: no banner' calls_are 0
-  known_fail 'empty counter, ok: no "[: integer expression" on stderr' \
-    'audit P2 validate fail-count' err_lacks 'integer expression expected'
+  check 'empty counter, ok: no error noise' err_empty
 
   new_case
   seed_counter job ''
@@ -472,77 +484,134 @@ test_bad_counter_file() {
   check 'empty counter, fail: no banner' calls_are 0
   check 'empty counter, fail: no error noise' err_empty
 
+  # A word would read as an unset variable in $(( )), a bad number would fail
+  # the expansion, and 08 would be rejected as octal; all must read as 0.
   echo '# garbage counter file'
-  for content in garbage 12abc; do
+  for content in garbage 12abc 08 -1; do
     new_case
     seed_counter job "${content}"
     run_wrap job -- /usr/bin/true
     check "counter '${content}', ok: exit 0" rc_is 0
     check "counter '${content}', ok: counter removed" counter_absent job
     check "counter '${content}', ok: no banner" calls_are 0
-    known_fail "counter '${content}', ok: no error on the job's stderr" \
-      'audit P2 validate fail-count' err_lacks 'integer expression expected'
+    check "counter '${content}', ok: no error on the job's stderr" err_empty
 
     new_case
     seed_counter job "${content}"
     run_wrap job -- /bin/sh -c 'exit 3'
-    if [ "${content}" = garbage ]; then
-      # A word reads as an unset variable in $(( )); set -u aborts the
-      # wrapper with exit 1. A bad number only fails the expansion.
-      known_fail "counter '${content}', fail: job exit 3 passed through" \
-        'audit P2 validate fail-count' rc_is 3
-    else
-      check "counter '${content}', fail: job exit 3 passed through" rc_is 3
-    fi
-    known_fail "counter '${content}', fail: counter reset to 1" \
-      'audit P2 validate fail-count' counter_is job 1
-    known_fail "counter '${content}', fail: FAILED audit line written" \
-      'audit P2 validate fail-count' audit_has 'FAILED exit 3'
+    check "counter '${content}', fail: job exit 3 passed through" rc_is 3
+    check "counter '${content}', fail: counter reset to 1" counter_is job 1
+    check "counter '${content}', fail: FAILED audit line written" \
+      audit_has 'FAILED exit 3'
+    check "counter '${content}', fail: no error noise" err_empty
   done
 }
 
-test_signal_to_wrapper() {
-  local job pidfile wpid wrc child=''
-  echo '# stop signal sent to the wrapper itself (launchctl kill, bootout)'
-  new_case
-  seed_counter svc 1
+#######################################
+# Starts the wrapper in the background around a job that records its own
+# pid, then sends the wrapper the given signal once the job is up. This is
+# what launchctl kill, bootout, logout and a KeepAlive restart do: the
+# signal lands on the wrapper, not on the job.
+# Globals:
+#   RC (set to the wrapper's exit status)
+#   CHILD (set to the job's pid, or empty if the job never started)
+# Arguments:
+#   Signal name, then the body of the job script (sh; $1 is the pid file).
+#######################################
+stop_wrapper_with() {
+  local sig="$1" body="$2" job pidfile wpid
   job="${CASE_DIR}/job.sh"
   pidfile="${CASE_DIR}/child.pid"
   # shellcheck disable=SC2016  # Expanded by the job script, not here.
-  printf '#!/bin/sh\necho $$ >"$1"\nexec /bin/sleep 30\n' >"${job}"
+  printf '#!/bin/sh\necho $$ >"$1"\n%s\n' "${body}" >"${job}"
   chmod +x "${job}"
 
-  # env execs the wrapper, so $! is the wrapper's own bash. SIGTERM, not
-  # SIGINT: a non-interactive shell starts async jobs with SIGINT ignored.
+  # env execs the wrapper, so $! is the wrapper's own bash. SIGINT is not
+  # tested: a non-interactive shell starts async jobs with SIGINT ignored,
+  # so the wrapper could neither receive nor trap it from here.
   env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
     OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
     "${WRAPPER}" svc -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
 
+  CHILD=''
   if ! wait_for_file "${pidfile}"; then
-    check 'wrapper started the job' false
     kill -KILL "${wpid}" 2>/dev/null
     wait "${wpid}" 2>/dev/null
-    return
+    return 1
   fi
-  child="$(cat "${pidfile}")"
-  leftover_pids="${leftover_pids} ${child}"
+  CHILD="$(cat "${pidfile}")"
+  leftover_pids="${leftover_pids} ${CHILD}"
+  # The job is up; give the wrapper a moment to reach its wait.
+  sleep 0.2
 
-  kill -TERM "${wpid}"
+  kill "-${sig}" "${wpid}"
   # The braces keep bash's "Terminated" job report out of the test output.
   { wait "${wpid}"; } 2>/dev/null
-  wrc=$?
-  RC="${wrc}"
+  RC=$?
+}
 
-  check 'SIGTERM to wrapper: exits 143' rc_is 143
-  check 'SIGTERM to wrapper: streak of 1 untouched' counter_is svc 1
-  check 'SIGTERM to wrapper: no banner' calls_are 0
-  known_fail 'SIGTERM to wrapper: stop recorded in the audit log' \
-    'audit P1 trap and forward HUP/INT/TERM' \
-    audit_has 'stopped by signal'
-  known_fail 'SIGTERM to wrapper: forwarded, job not orphaned' \
-    'audit P1 trap and forward HUP/INT/TERM' pid_gone "${child}"
+test_signal_to_wrapper() {
+  local sig
+  echo '# stop signal sent to the wrapper itself (launchctl kill, bootout)'
+  for sig in TERM HUP; do
+    new_case
+    seed_counter svc 1
+    if ! stop_wrapper_with "${sig}" 'exec /bin/sleep 30'; then
+      check "SIG${sig} to wrapper: wrapper started the job" false
+      continue
+    fi
+    check "SIG${sig} to wrapper: exits 143" rc_is 143
+    check "SIG${sig} to wrapper: streak of 1 untouched" counter_is svc 1
+    check "SIG${sig} to wrapper: no banner" calls_are 0
+    check "SIG${sig} to wrapper: stop recorded in the audit log" \
+      audit_has 'stopped by signal (exit 143'
+    check "SIG${sig} to wrapper: forwarded, job not orphaned" \
+      pid_gone "${CHILD}"
+    check "SIG${sig} to wrapper: no job-control noise on stderr" err_empty
+  done
+
+  echo '# job handles SIGTERM itself and exits 0: a clean stop'
+  new_case
+  seed_counter svc 1
+  # sleep runs in the background so sh can act on the trap at once, and the
+  # trap takes it down so the suite leaves nothing behind.
+  if ! stop_wrapper_with TERM \
+    "trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & wait \$!"; then
+    check 'clean stop: wrapper started the job' false
+    return
+  fi
+  check 'clean stop: job exit 0 passed through' rc_is 0
+  check 'clean stop: logged as ok' audit_has 'ok ('
+  check 'clean stop: streak cleared' counter_absent svc
+  check 'clean stop: no banner' calls_are 0
+  check 'clean stop: job gone' pid_gone "${CHILD}"
+}
+
+test_log_rotation() {
+  echo '# audit log trimmed to its last 5000 lines once past 1 MB'
+  new_case
+  seed_audit_lines 20000 # about 1.2 MB
+  run_wrap job -- /usr/bin/true
+  check 'rotation: exit 0' rc_is 0
+  check 'rotation: 5000 kept, plus the trim note and this run' \
+    audit_lines_are 5002
+  check 'rotation: the newest seed lines are the ones kept' \
+    audit_line_has 1 'line 15001'
+  check 'rotation: older lines gone' audit_lacks 'line 15000'
+  check 'rotation: trim recorded in the log' \
+    audit_line_has 5001 'audit log trimmed to the last 5000 lines'
+  check 'rotation: this run logged after the trim' audit_line_has 5002 'ok ('
+  check 'rotation: no temp file left beside the log' logs_dir_has_only_audit
+
+  echo '# a log under 1 MB is left alone'
+  new_case
+  seed_audit_lines 100
+  run_wrap job -- /usr/bin/true
+  check 'no rotation: all lines kept plus this run' audit_lines_are 101
+  check 'no rotation: first line intact' audit_line_has 1 'line 00001'
+  check 'no rotation: nothing about a trim' audit_lacks 'trimmed'
 }
 
 main() {
@@ -567,9 +636,9 @@ main() {
   test_crash_signals
   test_bad_counter_file
   test_signal_to_wrapper
+  test_log_rotation
 
-  printf '\n%d passed, %d failed, %d known-fail\n' \
-    "${passes}" "${failures}" "${known_fails}"
+  printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]
 }
 

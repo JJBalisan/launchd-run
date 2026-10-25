@@ -11,8 +11,12 @@ launchd-run.sh LABEL [--after N] -- command [args...]
 Runs the command, passes stdout, stderr and the exit code straight through, and
 raises a Notification Center banner once the job has failed `N` consecutive
 times (default 2), re-raising every run it stays broken and once more when it
-recovers. Central audit trail in `~/Library/Logs/launchd-run.log`; per-job
-counters in `~/.local/state/launchd-run/<label>/`.
+recovers. `N` must be a positive integer; anything else is a usage error
+(exit 64) and the command is not run. Central audit trail in
+`~/Library/Logs/launchd-run.log`; per-job counters in
+`~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
+plain decimal number reads as 0, so a corrupt one restarts the streak rather
+than breaking the wrapper.
 
 ## Install
 
@@ -40,6 +44,23 @@ count.
 
 This matters for `KeepAlive` servers, which exit by signal in normal use.
 Without it, two ordinary restarts look identical to two crashes.
+
+launchd stops a job by signalling its main process, which with the wrapper in
+front is the wrapper itself. The wrapper traps SIGHUP, SIGINT and SIGTERM,
+forwards SIGTERM to the command, waits for it to exit and then logs the stop
+(`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line and
+no orphaned command. A command that handles SIGTERM and exits 0 is logged as
+`ok`. One side effect: the command runs as a background job of the wrapper, so
+it starts with SIGINT and SIGQUIT ignored.
+
+## Log rotation
+
+The wrapper trims `~/Library/Logs/launchd-run.log` itself. Once the file passes
+1 MB (about 15,000 lines, some two years at the usual rate) it keeps the last
+5,000 lines: the trimmed copy is written beside the log and renamed over it, and
+the trim is noted in the log. A line another job appends during that rename can
+be lost, which is accepted for an audit trail of this kind. Nothing in
+`/etc/newsyslog.d` is needed.
 
 ## Why a wrapper rather than a line in each script
 
