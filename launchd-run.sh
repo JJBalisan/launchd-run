@@ -27,9 +27,16 @@ readonly EX_USAGE=64
 LABEL=''
 AUDIT=''
 
-# The job's exit status, kept global so the last line of the file can still
-# pass it through if main is cut short (see there).
-JOB_EXIT=0
+#######################################
+# Reports a malformed command line on stderr and exits with EX_USAGE.
+# Arguments:
+#   The complaint.
+#######################################
+usage_error() {
+  echo "launchd-run: $*" >&2
+  echo 'usage: launchd-run.sh LABEL [--after N] -- cmd...' >&2
+  exit "${EX_USAGE}"
+}
 
 #######################################
 # Appends one timestamped line to the central audit log.
@@ -70,7 +77,6 @@ notify() {
 # Parses the command line, runs the job and updates its failure streak.
 # Globals:
 #   LABEL, AUDIT (set here, then read-only)
-#   JOB_EXIT (set to the job's exit status)
 # Arguments:
 #   LABEL [--after N] -- command [args...]
 # Outputs:
@@ -85,15 +91,17 @@ main() {
   LABEL="${1:-}"
   shift || true
   if [[ -z "${LABEL}" ]]; then
-    echo "usage: launchd-run.sh LABEL [--after N] -- cmd..." >&2
-    exit "${EX_USAGE}"
+    usage_error 'no label given'
   fi
   readonly LABEL
 
   while (($# > 0)); do
     case "$1" in
       --after)
-        alert_after="$2"
+        alert_after="${2:-}"
+        if [[ ! "${alert_after}" =~ ^[1-9][0-9]*$ ]]; then
+          usage_error "--after needs a positive integer, got '${alert_after}'"
+        fi
         shift 2
         ;;
       --)
@@ -101,14 +109,12 @@ main() {
         break
         ;;
       *)
-        echo "launchd-run: unexpected argument $1" >&2
-        exit "${EX_USAGE}"
+        usage_error "unexpected argument $1"
         ;;
     esac
   done
   if (($# == 0)); then
-    echo "launchd-run: no command given" >&2
-    exit "${EX_USAGE}"
+    usage_error 'no command given'
   fi
 
   state="${HOME}/.local/state/launchd-run/${LABEL}"
@@ -136,11 +142,15 @@ main() {
   fi
   # The job is done; a further stop must not cut the bookkeeping short.
   trap '' HUP INT TERM
-  JOB_EXIT="${code}"
   elapsed=$(($(date +%s) - started))
 
+  # Anything but a plain decimal (so no leading zero, which $(( )) would read
+  # as octal) means the counter is missing or corrupt: start the streak over.
   fails_file="${state}/fail-count"
-  prev="$(cat "${fails_file}" 2>/dev/null || echo 0)"
+  prev="$(cat "${fails_file}" 2>/dev/null)"
+  if [[ ! "${prev}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    prev=0
+  fi
 
   # 129/130/137/143 are SIGHUP/SIGINT/SIGKILL/SIGTERM: somebody stopped the
   # job - a logout, a launchctl kill, a KeepAlive restart. That is not a
@@ -154,14 +164,10 @@ main() {
       ;;
   esac
 
-  # The streak comparisons below stay on [ ]: prev comes from a file and
-  # alert_after from the command line, and neither is validated yet. On a
-  # non-number [ ] prints an error and is false, whereas [[ ]] and (( ))
-  # would evaluate the text as arithmetic and can abort the wrapper.
-  if [[ "${code}" -eq 0 ]]; then
+  if ((code == 0)); then
     rm -f "${fails_file}"
     note "ok (${elapsed}s)"
-    if [ "${prev}" -ge "${alert_after}" ]; then
+    if ((prev >= alert_after)); then
       notify "Back to normal" "succeeded after ${prev} failed runs"
     fi
   else
@@ -170,7 +176,7 @@ main() {
     note "FAILED exit ${code} (${elapsed}s, consecutive: ${fails})"
     # One bad run can be a flaky network or a host mid-deploy; a pattern
     # cannot.
-    if [ "${fails}" -ge "${alert_after}" ]; then
+    if ((fails >= alert_after)); then
       notify "Job failing" \
         "exit ${code} on ${fails} consecutive runs - see the log"
     fi
@@ -180,8 +186,3 @@ main() {
 }
 
 main "$@"
-# main always exits, except when a corrupt fail-count file (such as "12abc")
-# makes the $(( )) above fail: bash then abandons main and resumes here. Pass
-# the job's status through in that case too.
-# shellcheck disable=SC2317  # Reachable, as above.
-exit "${JOB_EXIT}"

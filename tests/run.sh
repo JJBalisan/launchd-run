@@ -9,10 +9,7 @@
 # on PATH and records each call to a file instead of raising a banner. Nothing
 # outside the temp directory is written, and no network is used.
 #
-# Assertions print "ok" or "FAIL". A KNOWN-FAIL pins a defect from the
-# 2026-10-05 repo audit that is not fixed yet: it does not fail the run, but if
-# it starts passing it prints XPASS and does fail the run (like a strict
-# xfail), so whoever lands the fix moves the case into the normal checks.
+# Assertions print "ok" or "FAIL".
 #
 # LAUNCHD_RUN_WRAPPER points the suite at another copy of the wrapper (used to
 # check that the tests catch deliberately broken copies). The default is the
@@ -31,7 +28,6 @@ readonly STUB_BIN="${TMP_ROOT}/bin"
 
 passes=0
 failures=0
-known_fails=0
 case_n=0
 leftover_pids=''
 
@@ -66,26 +62,6 @@ check() {
   else
     printf 'FAIL        %s\n' "${desc}"
     failures=$((failures + 1))
-  fi
-}
-
-#######################################
-# Records an assertion that is expected to fail because of a known defect.
-# A pass is reported as XPASS and counts as a failure.
-# Arguments:
-#   Description, defect reference, then the command that should succeed once
-#   the defect is fixed.
-#######################################
-known_fail() {
-  local desc="$1" defect="$2"
-  shift 2
-  if "$@"; then
-    printf 'XPASS       %s [%s] - fixed? move it to check\n' \
-      "${desc}" "${defect}"
-    failures=$((failures + 1))
-  else
-    printf 'KNOWN-FAIL  %s [%s]\n' "${desc}" "${defect}"
-    known_fails=$((known_fails + 1))
   fi
 }
 
@@ -199,7 +175,6 @@ audit_lines_are() {
 }
 
 err_has() { grep -F -q -- "$1" "${CASE_DIR}/err"; }
-err_lacks() { ! grep -F -q -- "$1" "${CASE_DIR}/err"; }
 err_empty() { [ ! -s "${CASE_DIR}/err" ]; }
 out_is() { [ "$(cat "${CASE_DIR}/out")" = "$1" ]; }
 path_absent() { [ ! -e "$1" ]; }
@@ -228,7 +203,7 @@ pid_gone() {
 # --- Cases. ------------------------------------------------------------------
 
 test_argument_errors() {
-  local marker
+  local marker value
   echo '# argument errors'
 
   new_case
@@ -272,21 +247,23 @@ test_argument_errors() {
 
   new_case
   run_wrap job --after
-  known_fail '--after with no value: exit 64 (today: unbound variable, 1)' \
-    'audit P2 validate --after' rc_is 64
-  known_fail '--after with no value: usage error on stderr' \
-    'audit P2 validate --after' err_has 'usage'
+  check '--after with no value: exit 64' rc_is 64
+  check '--after with no value: usage error on stderr' err_has 'usage'
 
-  new_case
-  run_wrap job --after abc -- /bin/sh -c 'exit 3'
-  known_fail '--after abc: rejected with exit 64' \
-    'audit P2 validate --after' rc_is 64
+  for value in abc 0 -1 1x ''; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    run_wrap job --after "${value}" -- /usr/bin/touch "${marker}"
+    check "--after '${value}': rejected with exit 64" rc_is 64
+    check "--after '${value}': usage error on stderr" err_has 'usage'
+    check "--after '${value}': command not run" path_absent "${marker}"
+    check "--after '${value}': no state written" state_dir_absent
+  done
 
   new_case
   seed_counter job 0
   run_wrap job --after 0 -- /usr/bin/true
-  known_fail '--after 0: no recovery banner on a clean success' \
-    'audit P2 validate --after' calls_are 0
+  check '--after 0: no recovery banner, command not run' calls_are 0
 }
 
 test_ok_no_streak() {
@@ -461,8 +438,7 @@ test_bad_counter_file() {
   check 'empty counter, ok: exit 0' rc_is 0
   check 'empty counter, ok: counter removed' counter_absent job
   check 'empty counter, ok: no banner' calls_are 0
-  known_fail 'empty counter, ok: no "[: integer expression" on stderr' \
-    'audit P2 validate fail-count' err_lacks 'integer expression expected'
+  check 'empty counter, ok: no error noise' err_empty
 
   new_case
   seed_counter job ''
@@ -472,32 +448,26 @@ test_bad_counter_file() {
   check 'empty counter, fail: no banner' calls_are 0
   check 'empty counter, fail: no error noise' err_empty
 
+  # A word would read as an unset variable in $(( )), a bad number would fail
+  # the expansion, and 08 would be rejected as octal; all must read as 0.
   echo '# garbage counter file'
-  for content in garbage 12abc; do
+  for content in garbage 12abc 08 -1; do
     new_case
     seed_counter job "${content}"
     run_wrap job -- /usr/bin/true
     check "counter '${content}', ok: exit 0" rc_is 0
     check "counter '${content}', ok: counter removed" counter_absent job
     check "counter '${content}', ok: no banner" calls_are 0
-    known_fail "counter '${content}', ok: no error on the job's stderr" \
-      'audit P2 validate fail-count' err_lacks 'integer expression expected'
+    check "counter '${content}', ok: no error on the job's stderr" err_empty
 
     new_case
     seed_counter job "${content}"
     run_wrap job -- /bin/sh -c 'exit 3'
-    if [ "${content}" = garbage ]; then
-      # A word reads as an unset variable in $(( )); set -u aborts the
-      # wrapper with exit 1. A bad number only fails the expansion.
-      known_fail "counter '${content}', fail: job exit 3 passed through" \
-        'audit P2 validate fail-count' rc_is 3
-    else
-      check "counter '${content}', fail: job exit 3 passed through" rc_is 3
-    fi
-    known_fail "counter '${content}', fail: counter reset to 1" \
-      'audit P2 validate fail-count' counter_is job 1
-    known_fail "counter '${content}', fail: FAILED audit line written" \
-      'audit P2 validate fail-count' audit_has 'FAILED exit 3'
+    check "counter '${content}', fail: job exit 3 passed through" rc_is 3
+    check "counter '${content}', fail: counter reset to 1" counter_is job 1
+    check "counter '${content}', fail: FAILED audit line written" \
+      audit_has 'FAILED exit 3'
+    check "counter '${content}', fail: no error noise" err_empty
   done
 }
 
@@ -606,8 +576,7 @@ main() {
   test_bad_counter_file
   test_signal_to_wrapper
 
-  printf '\n%d passed, %d failed, %d known-fail\n' \
-    "${passes}" "${failures}" "${known_fails}"
+  printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]
 }
 

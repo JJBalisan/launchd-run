@@ -11,8 +11,12 @@ launchd-run.sh LABEL [--after N] -- command [args...]
 Runs the command, passes stdout, stderr and the exit code straight through, and
 raises a Notification Center banner once the job has failed `N` consecutive
 times (default 2), re-raising every run it stays broken and once more when it
-recovers. Central audit trail in `~/Library/Logs/launchd-run.log`; per-job
-counters in `~/.local/state/launchd-run/<label>/`.
+recovers. `N` must be a positive integer; anything else is a usage error
+(exit 64) and the command is not run. Central audit trail in
+`~/Library/Logs/launchd-run.log`; per-job counters in
+`~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
+plain decimal number reads as 0, so a corrupt one restarts the streak rather
+than breaking the wrapper.
 
 ## Install
 
