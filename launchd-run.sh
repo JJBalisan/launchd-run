@@ -23,6 +23,11 @@ set -uo pipefail
 # Exit status for a malformed command line (EX_USAGE in sysexits.h).
 readonly EX_USAGE=64
 
+# The audit log is trimmed to its last AUDIT_KEEP_LINES lines once it passes
+# AUDIT_MAX_BYTES: roughly 15,000 lines, or two years at the usual rate.
+readonly AUDIT_MAX_BYTES=1048576
+readonly AUDIT_KEEP_LINES=5000
+
 # Set once the arguments are parsed; read by note() and notify().
 LABEL=''
 AUDIT=''
@@ -49,6 +54,28 @@ usage_error() {
 note() {
   printf '%s  %-38s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${LABEL}" "$*" \
     >>"${AUDIT}"
+}
+
+#######################################
+# Trims the audit log to its last AUDIT_KEEP_LINES lines once it has grown
+# past AUDIT_MAX_BYTES. The trimmed copy is written beside the log and renamed
+# over it, so a reader never sees a torn file; a line another job appends
+# during the rename can be lost, which is accepted. The trim is noted in the
+# log so the gap is explained.
+# Globals:
+#   AUDIT
+#######################################
+rotate_audit() {
+  local size tmp
+  size="$(/usr/bin/stat -f%z "${AUDIT}" 2>/dev/null)" || return 0
+  ((size > AUDIT_MAX_BYTES)) || return 0
+  tmp="${AUDIT}.$$"
+  if tail -n "${AUDIT_KEEP_LINES}" "${AUDIT}" >"${tmp}" \
+    && /bin/mv -f "${tmp}" "${AUDIT}"; then
+    note "audit log trimmed to the last ${AUDIT_KEEP_LINES} lines"
+  else
+    rm -f "${tmp}"
+  fi
 }
 
 #######################################
@@ -122,6 +149,7 @@ main() {
   AUDIT="${HOME}/Library/Logs/launchd-run.log"
   readonly AUDIT
   mkdir -p "${state}"
+  rotate_audit
 
   started="$(date +%s)"
   # The job runs in the background so that a stop signal reaches the wrapper's

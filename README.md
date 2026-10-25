@@ -53,6 +53,15 @@ no orphaned command. A command that handles SIGTERM and exits 0 is logged as
 `ok`. One side effect: the command runs as a background job of the wrapper, so
 it starts with SIGINT and SIGQUIT ignored.
 
+## Log rotation
+
+The wrapper trims `~/Library/Logs/launchd-run.log` itself. Once the file passes
+1 MB (about 15,000 lines, some two years at the usual rate) it keeps the last
+5,000 lines: the trimmed copy is written beside the log and renamed over it, and
+the trim is noted in the log. A line another job appends during that rename can
+be lost, which is accepted for an audit trail of this kind. Nothing in
+`/etc/newsyslog.d` is needed.
+
 ## Why a wrapper rather than a line in each script
 
 The jobs it guards are written in different languages and live in different

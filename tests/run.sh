@@ -168,6 +168,34 @@ audit_has() {
   grep -F -q -- "$1" "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
 }
 
+audit_lacks() { ! audit_has "$1"; }
+
+# Line N of the audit log contains the fixed string.
+audit_line_has() {
+  local line
+  line="$(sed -n "$1p" "${CASE_HOME}/Library/Logs/launchd-run.log")"
+  case "${line}" in
+    *"$2"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Nothing but the audit log sits in ~/Library/Logs (no temp file left over).
+logs_dir_has_only_audit() {
+  local n
+  n="$(find "${CASE_HOME}/Library/Logs" -mindepth 1 | wc -l | tr -d ' ')"
+  [ "${n}" -eq 1 ]
+}
+
+# Writes N audit-shaped lines (about 60 bytes each) as the case's log.
+seed_audit_lines() {
+  awk -v n="$1" 'BEGIN {
+    for (i = 1; i <= n; i++) {
+      printf "2026-01-01 00:00:00  seed%-34s line %05d\n", "", i
+    }
+  }' >"${CASE_HOME}/Library/Logs/launchd-run.log"
+}
+
 audit_lines_are() {
   local f="${CASE_HOME}/Library/Logs/launchd-run.log" n=0
   [ -f "${f}" ] && n="$(wc -l <"${f}" | tr -d ' ')"
@@ -561,6 +589,31 @@ test_signal_to_wrapper() {
   check 'clean stop: job gone' pid_gone "${CHILD}"
 }
 
+test_log_rotation() {
+  echo '# audit log trimmed to its last 5000 lines once past 1 MB'
+  new_case
+  seed_audit_lines 20000 # about 1.2 MB
+  run_wrap job -- /usr/bin/true
+  check 'rotation: exit 0' rc_is 0
+  check 'rotation: 5000 kept, plus the trim note and this run' \
+    audit_lines_are 5002
+  check 'rotation: the newest seed lines are the ones kept' \
+    audit_line_has 1 'line 15001'
+  check 'rotation: older lines gone' audit_lacks 'line 15000'
+  check 'rotation: trim recorded in the log' \
+    audit_line_has 5001 'audit log trimmed to the last 5000 lines'
+  check 'rotation: this run logged after the trim' audit_line_has 5002 'ok ('
+  check 'rotation: no temp file left beside the log' logs_dir_has_only_audit
+
+  echo '# a log under 1 MB is left alone'
+  new_case
+  seed_audit_lines 100
+  run_wrap job -- /usr/bin/true
+  check 'no rotation: all lines kept plus this run' audit_lines_are 101
+  check 'no rotation: first line intact' audit_line_has 1 'line 00001'
+  check 'no rotation: nothing about a trim' audit_lacks 'trimmed'
+}
+
 main() {
   if [ ! -x "${WRAPPER}" ]; then
     echo "run.sh: wrapper not found or not executable: ${WRAPPER}" >&2
@@ -583,6 +636,7 @@ main() {
   test_crash_signals
   test_bad_counter_file
   test_signal_to_wrapper
+  test_log_rotation
 
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]
