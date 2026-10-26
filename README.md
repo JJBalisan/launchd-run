@@ -13,7 +13,9 @@ raises a Notification Center banner once the job has failed `N` consecutive
 times (default 2), re-raising every run it stays broken and once more when it
 recovers. `N` must be a positive integer; anything else is a usage error
 (exit 64) and the command is not run. Central audit trail in
-`~/Library/Logs/launchd-run.log`; per-job counters in
+`~/Library/Logs/launchd-run.log`: every run writes a start line,
+`started: launchd-run <version>`, naming the wrapper's own checkout (see
+"Releasing"), then an outcome line; per-job counters in
 `~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
 plain decimal number reads as 0, so a corrupt one restarts the streak rather
 than breaking the wrapper.
@@ -61,6 +63,32 @@ The wrapper trims `~/Library/Logs/launchd-run.log` itself. Once the file passes
 the trim is noted in the log. A line another job appends during that rename can
 be lost, which is accepted for an audit trail of this kind. Nothing in
 `/etc/newsyslog.d` is needed.
+
+## Releasing
+
+`install.sh` symlinks the wrapper into this checkout, so deploying is
+`git pull` here and a release is just a name for what is deployed. The
+version on each start line is `git describe --tags --long --dirty` of the
+checkout (`lib/version.sh`): `v1.0.0-0-g<sha>` on a release, `v1.0.0-3-g<sha>`
+three commits past it, `-dirty` appended while the tree has local edits,
+`unknown` if the wrapper was copied out of the repo. `./install.sh` prints the
+version it installs.
+
+1. Move the `[Unreleased]` entries in `CHANGELOG.md` under a new
+   `[X.Y.Z] - date` heading and update the compare links at the bottom.
+2. Merge to `main`, pull, then tag the merge commit and push the tag over
+   SSH (the https remote pushes only through the gh credential helper):
+
+   ```bash
+   git tag -a vX.Y.Z -m vX.Y.Z \
+     && git push git@github.com:JJBalisan/launchd-run.git vX.Y.Z
+   ```
+
+3. The next run of any wrapped job starts with
+   `started: launchd-run vX.Y.Z-0-g<sha>` in the audit log.
+
+MAJOR when the wrapper changes what it counts, when it alerts or where it
+writes, MINOR for a new flag or behaviour, PATCH for a fix.
 
 ## Why a wrapper rather than a line in each script
 

@@ -20,6 +20,14 @@
 
 set -uo pipefail
 
+# Names the checkout this run comes from, resolved through the installed
+# symlink; "unknown" if the wrapper was copied out of the repo. Sourced
+# before anything else so $0 still resolves.
+LIB="$(dirname "$(/usr/bin/readlink -f "$0")")/lib/version.sh"
+# shellcheck source=lib/version.sh
+. "${LIB}" 2>/dev/null \
+  || repo_version() { echo "${REPO_VERSION:-unknown}"; }
+
 # Exit status for a malformed command line (EX_USAGE in sysexits.h).
 readonly EX_USAGE=64
 
@@ -150,6 +158,11 @@ main() {
   readonly AUDIT
   mkdir -p "${state}"
   rotate_audit
+
+  # One start line per run, naming the wrapper's own checkout, so an audit
+  # line maps to the commit that wrote it. A KeepAlive server that runs for
+  # days leaves this line long before its outcome.
+  note "started: launchd-run $(repo_version)"
 
   started="$(date +%s)"
   # The job runs in the background so that a stop signal reaches the wrapper's

@@ -14,6 +14,9 @@
 # LAUNCHD_RUN_WRAPPER points the suite at another copy of the wrapper (used to
 # check that the tests catch deliberately broken copies). The default is the
 # repo's launchd-run.sh.
+#
+# The wrapper logs the checkout's version (lib/version.sh) on every start
+# line; the suite pins it to vTEST so the transcripts do not depend on git.
 
 set -uo pipefail
 
@@ -21,6 +24,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPO
 readonly WRAPPER="${LAUNCHD_RUN_WRAPPER:-${REPO}/launchd-run.sh}"
 readonly SYS_PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+readonly TEST_VERSION='vTEST'
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/launchd-run-tests.XXXXXX")" || exit 2
 readonly TMP_ROOT
@@ -108,7 +112,7 @@ new_case() {
 run_wrap() {
   env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
     OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    OSASCRIPT_EXIT="${OSASCRIPT_EXIT:-0}" \
+    OSASCRIPT_EXIT="${OSASCRIPT_EXIT:-0}" REPO_VERSION="${TEST_VERSION}" \
     "${WRAPPER}" "$@" >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
   RC=$?
 }
@@ -307,7 +311,14 @@ test_ok_no_streak() {
   check 'ok: no counter file' counter_absent job
   check 'ok: audit line "ok ("' audit_has 'ok ('
   check 'ok: audit line carries the label' audit_has ' job '
-  check 'ok: exactly one audit line' audit_lines_are 1
+  check 'ok: start line first, naming the wrapper version' \
+    audit_line_has 1 "started: launchd-run ${TEST_VERSION}"
+  check 'ok: start line carries the label' audit_line_has 1 ' job '
+  check 'ok: outcome line second' audit_line_has 2 'ok ('
+  check 'ok: exactly two audit lines' audit_lines_are 2
+  check 'ok: version not on the job stdout' out_is 'a b|c'
+  check 'ok: version not on the job stderr' \
+    [ "$(cat "${CASE_DIR}/err")" = 'to-err' ]
 }
 
 test_fail_threshold() {
@@ -410,7 +421,8 @@ test_recovery() {
   check 'cycle: second banner is the recovery' \
     call_has 2 'succeeded after 2 failed runs'
   check 'cycle: counter cleared' counter_absent job
-  check 'cycle: three audit lines plus two alert lines' audit_lines_are 5
+  check 'cycle: three start lines, three outcomes, two alert lines' \
+    audit_lines_are 8
 }
 
 test_stop_signals() {
@@ -531,6 +543,7 @@ stop_wrapper_with() {
   # so the wrapper could neither receive nor trap it from here.
   env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
     OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
+    REPO_VERSION="${TEST_VERSION}" \
     "${WRAPPER}" svc -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
@@ -596,20 +609,22 @@ test_log_rotation() {
   run_wrap job -- /usr/bin/true
   check 'rotation: exit 0' rc_is 0
   check 'rotation: 5000 kept, plus the trim note and this run' \
-    audit_lines_are 5002
+    audit_lines_are 5003
   check 'rotation: the newest seed lines are the ones kept' \
     audit_line_has 1 'line 15001'
   check 'rotation: older lines gone' audit_lacks 'line 15000'
   check 'rotation: trim recorded in the log' \
     audit_line_has 5001 'audit log trimmed to the last 5000 lines'
-  check 'rotation: this run logged after the trim' audit_line_has 5002 'ok ('
+  check 'rotation: this run starts after the trim' \
+    audit_line_has 5002 "started: launchd-run ${TEST_VERSION}"
+  check 'rotation: this run logged after the trim' audit_line_has 5003 'ok ('
   check 'rotation: no temp file left beside the log' logs_dir_has_only_audit
 
   echo '# a log under 1 MB is left alone'
   new_case
   seed_audit_lines 100
   run_wrap job -- /usr/bin/true
-  check 'no rotation: all lines kept plus this run' audit_lines_are 101
+  check 'no rotation: all lines kept plus this run' audit_lines_are 102
   check 'no rotation: first line intact' audit_line_has 1 'line 00001'
   check 'no rotation: nothing about a trim' audit_lacks 'trimmed'
 }
