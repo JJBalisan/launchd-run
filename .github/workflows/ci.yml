@@ -6,20 +6,8 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-latest
+    runs-on: ${{ vars.CI_RUNNER || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v5
-      - name: Install shellcheck and shfmt
-        run: |
-          command -v shellcheck || brew install shellcheck
-          command -v shfmt || brew install shfmt
-      - name: Format (shfmt, Google shell guide flags)
-        run: shfmt -d -i 2 -ci -bn launchd-run.sh install.sh tests/run.sh
-      - name: Shellcheck
-        run: |
-          shellcheck launchd-run.sh
-          shellcheck install.sh tests/run.sh
-      - name: Tests (bash on PATH)
-        run: bash tests/run.sh
-      - name: Tests (/bin/bash 3.2, as launchd runs it)
-        run: /bin/bash tests/run.sh
+      - name: CI (the same script runs locally)
+        run: bash tests/ci.sh
