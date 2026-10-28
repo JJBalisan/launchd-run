@@ -13,6 +13,12 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+### Changed
+
+- README: the "blind spot" pointer named the `spicetify-autoupgrade` repo,
+  archived on 27 Oct 2026; it now names that job and `miniflux-healthcheck`
+  in launchd-jobs (#11).
+
 ## [1.0.0] - 2026-10-26
 
 First tagged release: the wrapper as it stands after the 25 October 2026

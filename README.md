@@ -98,8 +98,12 @@ guards all of them without editing a single working script, and it catches
 non-zero exits uniformly.
 
 Its blind spot is the job that exits 0 having done nothing. No wrapper can see
-that; the job itself has to notice. See `spicetify-autoupgrade` for that
-pattern.
+that; the job itself has to notice. Two jobs in
+[launchd-jobs](https://github.com/JJBalisan/launchd-jobs) do:
+`miniflux-healthcheck` fails when no feed has been polled for 3 h even though
+the health endpoint answers, and `spicetify-autoupgrade` compares the
+`spicetify` on PATH with the version Homebrew installed, so a shadowed binary
+is not taken for an up-to-date one.
 
 ## Do not wrap a job that drives the GUI
 
