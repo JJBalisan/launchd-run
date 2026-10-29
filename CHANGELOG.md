@@ -13,6 +13,8 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-29
+
 ### Changed
 
 - CI follows dev-toolchain's template: push runs on `main` only and a
@@ -63,6 +65,7 @@ audit fixes (#8) and the single-script CI (#9).
   `tests/version.sh` for the lib; `tests/ci.sh` is the whole CI as one
   script and the workflow's only step (#9), linting every tracked `.sh`.
 
-[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/JJBalisan/launchd-run/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/JJBalisan/launchd-run/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/JJBalisan/launchd-run/releases/tag/v1.0.0
