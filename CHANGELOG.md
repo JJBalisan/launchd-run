@@ -13,6 +13,13 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+### Changed
+
+- CI follows dev-toolchain's template: push runs on `main` only and a
+  newer push to a PR cancels its older run, so a PR runs once;
+  `actions/checkout` v7.
+- `lib/version.sh` refreshed from dev-toolchain's template.
+
 ## [1.0.1] - 2026-10-28
 
 ### Changed
