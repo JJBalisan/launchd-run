@@ -13,6 +13,10 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+### Added
+
+- MIT licence (`LICENSE`); the repository is now public.
+
 ## [1.0.2] - 2026-10-29
 
 ### Changed
