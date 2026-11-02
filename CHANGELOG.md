@@ -13,6 +13,12 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+### Changed
+
+- The pre-commit shellcheck hook passes `-x`, as dev-toolchain's template
+  does, so a staged script whose sourced file is not staged no longer fails
+  SC1091 (dev-toolchain#43).
+
 ## [1.0.3] - 2026-10-29
 
 ### Added
