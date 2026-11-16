@@ -118,6 +118,31 @@ run_wrap() {
 }
 
 #######################################
+# Like run_wrap, but through perl's system(), which (unlike the shell's $?)
+# tells a process killed by signal N from one that exited 128+N, as launchd
+# does. Runs in $CASE_DIR, so a job's core or stackdump lands there.
+# Globals:
+#   RC (set to the exit status, or 128+N when killed by signal N)
+#   KILLED_BY (set to the signal number that killed the wrapper, or 0)
+# Arguments:
+#   Arguments for launchd-run.sh.
+#######################################
+run_wrap_raw() {
+  # shellcheck disable=SC2016  # $? and $f belong to perl.
+  (cd "${CASE_DIR}" \
+    && env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
+      OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
+      REPO_VERSION="${TEST_VERSION}" \
+      /usr/bin/perl -e 'my $f = shift; system(@ARGV);
+        open(my $h, ">", $f) or die; print $h ($? & 127);
+        exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' \
+      "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
+      >"${CASE_DIR}/out" 2>"${CASE_DIR}/err")
+  RC=$?
+  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+}
+
+#######################################
 # Path of a label's fail counter in the current case.
 #######################################
 counter_file() {
@@ -467,14 +492,39 @@ test_crash_signals() {
   for sig in 134 138 139; do
     new_case
     seed_counter job 1
-    run_wrap job -- /bin/sh -c "exit ${sig}"
+    # Through perl: the wrapper now dies of the signal (139 is SIGSEGV), and
+    # run_wrap would have this shell print its own "Segmentation fault".
+    run_wrap_raw job -- /bin/sh -c "exit ${sig}"
     check "exit ${sig}: passed through" rc_is "${sig}"
+    check "exit ${sig}: wrapper killed by signal $((sig - 128))" \
+      [ "${KILLED_BY}" = "$((sig - 128))" ]
     check "exit ${sig}: counter 1 -> 2" counter_is job 2
     check "exit ${sig}: banner at threshold" calls_are 1
     check "exit ${sig}: banner names the exit code" \
       call_has 1 "exit ${sig} on 2 consecutive runs"
     check "exit ${sig}: audit FAILED line" audit_has "FAILED exit ${sig} ("
   done
+
+  # launchd's KeepAlive Crashed key restarts a job only if it died of a
+  # crash signal, so the wrapper must die of it too, not exit 128+N.
+  echo '# a real crash: the wrapper dies of the same signal'
+  for sig in SEGV ABRT; do
+    new_case
+    seed_counter job 1
+    run_wrap_raw job -- /bin/sh -c "ulimit -c 0; kill -${sig} \$\$"
+    check "SIG${sig}: wrapper killed by SIG${sig}" \
+      [ "${KILLED_BY}" = "$(kill -l "${sig}")" ]
+    check "SIG${sig}: counter 1 -> 2" counter_is job 2
+    check "SIG${sig}: banner at threshold" calls_are 1
+    check "SIG${sig}: audit FAILED line" \
+      audit_has "FAILED exit $((128 + $(kill -l "${sig}"))) ("
+    check "SIG${sig}: no shell crash report on the job's stderr" err_empty
+  done
+
+  new_case
+  run_wrap_raw job -- /bin/sh -c 'exit 3'
+  check 'plain failure: wrapper exits normally' [ "${KILLED_BY}" = 0 ]
+  check 'plain failure: exit 3' rc_is 3
 }
 
 test_bad_counter_file() {
@@ -517,6 +567,48 @@ test_bad_counter_file() {
       audit_has 'FAILED exit 3'
     check "counter '${content}', fail: no error noise" err_empty
   done
+
+  # ~/.local/state as a file stands in for one left root-owned by a sudo
+  # install: the counter cannot be written, so the streak would stick at 1
+  # and never reach --after.
+  echo '# state directory cannot be made'
+  new_case
+  mkdir -p "${CASE_HOME}/.local"
+  : >"${CASE_HOME}/.local/state"
+  run_wrap job -- /bin/sh -c 'exit 3'
+  check 'unwritable state, fail: job exit 3 passed through' rc_is 3
+  check 'unwritable state, fail: alerts on the first failure' calls_are 1
+  check 'unwritable state, fail: banner says the count is lost' \
+    call_has 1 'exit 3; its failure count cannot be saved - see the log'
+  check 'unwritable state, fail: audit names the counter it cannot write' \
+    audit_has 's, consecutive: unknown - cannot write'
+  check 'unwritable state, fail: no error on the job stderr' err_empty
+  run_wrap job -- /bin/sh -c 'exit 3'
+  check 'unwritable state, fail again: alerts again' calls_are 2
+  run_wrap job -- /usr/bin/true
+  check 'unwritable state, ok: exit 0' rc_is 0
+  check 'unwritable state, ok: no banner' calls_are 2
+  check 'unwritable state, ok: no error on the job stderr' err_empty
+
+  # A streak left in a directory the wrapper cannot write to (root-owned
+  # after a sudo run) cannot be cleared, so a success must not claim a
+  # recovery that the next run would claim again.
+  echo '# fail count that cannot be cleared'
+  new_case
+  seed_counter job 2
+  chmod a-w "${CASE_HOME}/.local/state/launchd-run/job"
+  if : 2>/dev/null >"${CASE_HOME}/.local/state/launchd-run/job/probe"; then
+    # Root, or a filesystem (Windows) that ignores directory permissions.
+    printf 'skip        %s\n' 'uncleared count: directory is still writable'
+  else
+    run_wrap job -- /usr/bin/true
+    check 'uncleared count, ok: exit 0' rc_is 0
+    check 'uncleared count, ok: no recovery banner' calls_are 0
+    check 'uncleared count, ok: audit names the counter it cannot clear' \
+      audit_has 's) - cannot clear'
+    check 'uncleared count, ok: no error on the job stderr' err_empty
+  fi
+  chmod u+w "${CASE_HOME}/.local/state/launchd-run/job"
 }
 
 #######################################

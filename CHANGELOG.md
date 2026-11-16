@@ -13,6 +13,20 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+### Fixed
+
+- A job that dies of a crash signal (SIGSEGV, SIGABRT, SIGBUS, ...) now
+  takes the wrapper down with the same signal instead of an `exit 139`, so
+  launchd sees a crash and `KeepAlive = { Crashed = true; }` restarts it.
+  bash's own "Segmentation fault" report no longer lands on the job's stderr.
+- A failure count that cannot be saved (a root-owned or non-directory
+  `~/.local/state`) no longer leaves the streak stuck at 1 with no alert:
+  every failure then raises a banner and the audit line says why.
+- A failure count that cannot be cleared (it sits in a directory the wrapper
+  cannot write to) no longer raises a false "Back to normal" banner, with
+  `rm: Permission denied` on the job's stderr, on every success. The audit
+  line says the counter cannot be cleared.
+
 ## [1.0.4] - 2026-11-02
 
 ### Changed

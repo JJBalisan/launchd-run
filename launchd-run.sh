@@ -122,7 +122,7 @@ notify() {
 #######################################
 main() {
   local alert_after=2
-  local state fails_file prev fails started pid stopped='' code elapsed
+  local state fails_file prev fails started pid stopped='' code elapsed sig
 
   LABEL="${1:-}"
   shift || true
@@ -156,7 +156,9 @@ main() {
   state="${HOME}/.local/state/launchd-run/${LABEL}"
   AUDIT="${HOME}/Library/Logs/launchd-run.log"
   readonly AUDIT
-  mkdir -p "${state}"
+  # A state directory that cannot be made is reported where the counter is
+  # written, in the audit log, not on the job's stderr.
+  mkdir -p "${state}" 2>/dev/null
   rotate_audit
 
   # One start line per run, naming the wrapper's own checkout, so an audit
@@ -173,13 +175,15 @@ main() {
   "$@" <&0 &
   pid=$!
   trap 'stopped=1; kill -TERM "${pid}" 2>/dev/null' HUP INT TERM
-  wait "${pid}"
+  # The braces keep bash's own "Segmentation fault ..." report of a crashed
+  # job off the job's stderr.
+  { wait "${pid}"; } 2>/dev/null
   code=$?
   if [[ -n "${stopped}" ]]; then
     # The trap interrupted wait with 128+signal before the job had exited.
     # Wait for the job itself and take its status whatever it is: a job that
     # handles SIGTERM and exits 0 has stopped cleanly.
-    wait "${pid}"
+    { wait "${pid}"; } 2>/dev/null
     code=$?
   fi
   # The job is done; a further stop must not cut the bookkeeping short.
@@ -207,23 +211,52 @@ main() {
   esac
 
   if ((code == 0)); then
-    rm -f "${fails_file}"
-    note "ok (${elapsed}s)"
-    if ((prev >= alert_after)); then
-      notify "Back to normal" "succeeded after ${prev} failed runs"
+    # A counter that cannot be cleared (a state directory left root-owned by
+    # a sudo run) reads back the same streak on every success, so only a
+    # streak that was really cleared is reported as a recovery.
+    if rm -f "${fails_file}" 2>/dev/null; then
+      note "ok (${elapsed}s)"
+      if ((prev >= alert_after)); then
+        notify "Back to normal" "succeeded after ${prev} failed runs"
+      fi
+    else
+      note "ok (${elapsed}s) - cannot clear ${fails_file}"
     fi
   else
     fails=$((prev + 1))
-    printf '%s' "${fails}" >"${fails_file}"
-    note "FAILED exit ${code} (${elapsed}s, consecutive: ${fails})"
-    # One bad run can be a flaky network or a host mid-deploy; a pattern
-    # cannot.
-    if ((fails >= alert_after)); then
+    if { printf '%s' "${fails}" >"${fails_file}"; } 2>/dev/null; then
+      note "FAILED exit ${code} (${elapsed}s, consecutive: ${fails})"
+      # One bad run can be a flaky network or a host mid-deploy; a pattern
+      # cannot.
+      if ((fails >= alert_after)); then
+        notify "Job failing" \
+          "exit ${code} on ${fails} consecutive runs - see the log"
+      fi
+    else
+      # Without a counter the streak never reaches --after and a job that
+      # fails every run would never alert, so alert on every failure.
+      note "FAILED exit ${code} (${elapsed}s, consecutive: unknown -" \
+        "cannot write ${fails_file})"
       notify "Job failing" \
-        "exit ${code} on ${fails} consecutive runs - see the log"
+        "exit ${code}; its failure count cannot be saved - see the log"
     fi
   fi
 
+  # A job killed by a crash signal reaches the wrapper as 128+N. Die of the
+  # same signal instead of exiting 128+N, so launchd still sees a crash and
+  # KeepAlive's Crashed key works as it would without the wrapper. A job that
+  # itself exits 128+N cannot be told apart, and is passed on the same way.
+  # The wrapper's own bash must not leave a core behind.
+  if ((code > 128)); then
+    sig="$(kill -l "$((code - 128))" 2>/dev/null)"
+    case "${sig}" in
+      ILL | TRAP | ABRT | IOT | EMT | FPE | BUS | SEGV | SYS)
+        ulimit -c 0
+        trap - "${sig}"
+        kill -s "${sig}" "$$"
+        ;;
+    esac
+  fi
   exit "${code}"
 }
 
