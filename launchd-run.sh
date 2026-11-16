@@ -211,10 +211,16 @@ main() {
   esac
 
   if ((code == 0)); then
-    rm -f "${fails_file}"
-    note "ok (${elapsed}s)"
-    if ((prev >= alert_after)); then
-      notify "Back to normal" "succeeded after ${prev} failed runs"
+    # A counter that cannot be cleared (a state directory left root-owned by
+    # a sudo run) reads back the same streak on every success, so only a
+    # streak that was really cleared is reported as a recovery.
+    if rm -f "${fails_file}" 2>/dev/null; then
+      note "ok (${elapsed}s)"
+      if ((prev >= alert_after)); then
+        notify "Back to normal" "succeeded after ${prev} failed runs"
+      fi
+    else
+      note "ok (${elapsed}s) - cannot clear ${fails_file}"
     fi
   else
     fails=$((prev + 1))

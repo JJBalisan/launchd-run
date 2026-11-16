@@ -585,6 +585,26 @@ test_bad_counter_file() {
   check 'unwritable state, ok: exit 0' rc_is 0
   check 'unwritable state, ok: no banner' calls_are 2
   check 'unwritable state, ok: no error on the job stderr' err_empty
+
+  # A streak left in a directory the wrapper cannot write to (root-owned
+  # after a sudo run) cannot be cleared, so a success must not claim a
+  # recovery that the next run would claim again.
+  echo '# fail count that cannot be cleared'
+  new_case
+  seed_counter job 2
+  chmod a-w "${CASE_HOME}/.local/state/launchd-run/job"
+  if : 2>/dev/null >"${CASE_HOME}/.local/state/launchd-run/job/probe"; then
+    # Root, or a filesystem (Windows) that ignores directory permissions.
+    printf 'skip        %s\n' 'uncleared count: directory is still writable'
+  else
+    run_wrap job -- /usr/bin/true
+    check 'uncleared count, ok: exit 0' rc_is 0
+    check 'uncleared count, ok: no recovery banner' calls_are 0
+    check 'uncleared count, ok: audit names the counter it cannot clear' \
+      audit_has 's) - cannot clear'
+    check 'uncleared count, ok: no error on the job stderr' err_empty
+  fi
+  chmod u+w "${CASE_HOME}/.local/state/launchd-run/job"
 }
 
 #######################################
