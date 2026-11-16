@@ -42,7 +42,8 @@ Exit codes 129, 130, 137 and 143 (SIGHUP, SIGINT, SIGKILL, SIGTERM) mean
 somebody stopped the job — a logout, a `launchctl kill`, a `KeepAlive` restart.
 Those are recorded and ignored: they neither raise the counter nor clear an
 existing streak. Crash signals (134 SIGABRT, 138 SIGBUS, 139 SIGSEGV) still
-count.
+count, and the wrapper then dies of the same signal rather than exiting with
+the code, so launchd still sees a crash and `KeepAlive`'s `Crashed` key works.
 
 This matters for `KeepAlive` servers, which exit by signal in normal use.
 Without it, two ordinary restarts look identical to two crashes.

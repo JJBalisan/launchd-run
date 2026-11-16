@@ -118,6 +118,31 @@ run_wrap() {
 }
 
 #######################################
+# Like run_wrap, but through perl's system(), which (unlike the shell's $?)
+# tells a process killed by signal N from one that exited 128+N, as launchd
+# does. Runs in $CASE_DIR, so a job's core or stackdump lands there.
+# Globals:
+#   RC (set to the exit status, or 128+N when killed by signal N)
+#   KILLED_BY (set to the signal number that killed the wrapper, or 0)
+# Arguments:
+#   Arguments for launchd-run.sh.
+#######################################
+run_wrap_raw() {
+  # shellcheck disable=SC2016  # $? and $f belong to perl.
+  (cd "${CASE_DIR}" \
+    && env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
+      OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
+      REPO_VERSION="${TEST_VERSION}" \
+      /usr/bin/perl -e 'my $f = shift; system(@ARGV);
+        open(my $h, ">", $f) or die; print $h ($? & 127);
+        exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' \
+      "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
+      >"${CASE_DIR}/out" 2>"${CASE_DIR}/err")
+  RC=$?
+  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+}
+
+#######################################
 # Path of a label's fail counter in the current case.
 #######################################
 counter_file() {
@@ -475,6 +500,27 @@ test_crash_signals() {
       call_has 1 "exit ${sig} on 2 consecutive runs"
     check "exit ${sig}: audit FAILED line" audit_has "FAILED exit ${sig} ("
   done
+
+  # launchd's KeepAlive Crashed key restarts a job only if it died of a
+  # crash signal, so the wrapper must die of it too, not exit 128+N.
+  echo '# a real crash: the wrapper dies of the same signal'
+  for sig in SEGV ABRT; do
+    new_case
+    seed_counter job 1
+    run_wrap_raw job -- /bin/sh -c "ulimit -c 0; kill -${sig} \$\$"
+    check "SIG${sig}: wrapper killed by SIG${sig}" \
+      [ "${KILLED_BY}" = "$(kill -l "${sig}")" ]
+    check "SIG${sig}: counter 1 -> 2" counter_is job 2
+    check "SIG${sig}: banner at threshold" calls_are 1
+    check "SIG${sig}: audit FAILED line" \
+      audit_has "FAILED exit $((128 + $(kill -l "${sig}"))) ("
+    check "SIG${sig}: no shell crash report on the job's stderr" err_empty
+  done
+
+  new_case
+  run_wrap_raw job -- /bin/sh -c 'exit 3'
+  check 'plain failure: wrapper exits normally' [ "${KILLED_BY}" = 0 ]
+  check 'plain failure: exit 3' rc_is 3
 }
 
 test_bad_counter_file() {

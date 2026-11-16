@@ -122,7 +122,7 @@ notify() {
 #######################################
 main() {
   local alert_after=2
-  local state fails_file prev fails started pid stopped='' code elapsed
+  local state fails_file prev fails started pid stopped='' code elapsed sig
 
   LABEL="${1:-}"
   shift || true
@@ -173,13 +173,15 @@ main() {
   "$@" <&0 &
   pid=$!
   trap 'stopped=1; kill -TERM "${pid}" 2>/dev/null' HUP INT TERM
-  wait "${pid}"
+  # The braces keep bash's own "Segmentation fault ..." report of a crashed
+  # job off the job's stderr.
+  { wait "${pid}"; } 2>/dev/null
   code=$?
   if [[ -n "${stopped}" ]]; then
     # The trap interrupted wait with 128+signal before the job had exited.
     # Wait for the job itself and take its status whatever it is: a job that
     # handles SIGTERM and exits 0 has stopped cleanly.
-    wait "${pid}"
+    { wait "${pid}"; } 2>/dev/null
     code=$?
   fi
   # The job is done; a further stop must not cut the bookkeeping short.
@@ -224,6 +226,21 @@ main() {
     fi
   fi
 
+  # A job killed by a crash signal reaches the wrapper as 128+N. Die of the
+  # same signal instead of exiting 128+N, so launchd still sees a crash and
+  # KeepAlive's Crashed key works as it would without the wrapper. A job that
+  # itself exits 128+N cannot be told apart, and is passed on the same way.
+  # The wrapper's own bash must not leave a core behind.
+  if ((code > 128)); then
+    sig="$(kill -l "$((code - 128))" 2>/dev/null)"
+    case "${sig}" in
+      ILL | TRAP | ABRT | IOT | EMT | FPE | BUS | SEGV | SYS)
+        ulimit -c 0
+        trap - "${sig}"
+        kill -s "${sig}" "$$"
+        ;;
+    esac
+  fi
   exit "${code}"
 }
 

@@ -13,6 +13,13 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+### Fixed
+
+- A job that dies of a crash signal (SIGSEGV, SIGABRT, SIGBUS, ...) now
+  takes the wrapper down with the same signal instead of an `exit 139`, so
+  launchd sees a crash and `KeepAlive = { Crashed = true; }` restarts it.
+  bash's own "Segmentation fault" report no longer lands on the job's stderr.
+
 ## [1.0.4] - 2026-11-02
 
 ### Changed
