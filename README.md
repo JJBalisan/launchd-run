@@ -18,7 +18,8 @@ recovers. `N` must be a positive integer; anything else is a usage error
 "Releasing"), then an outcome line; per-job counters in
 `~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
 plain decimal number reads as 0, so a corrupt one restarts the streak rather
-than breaking the wrapper.
+than breaking the wrapper. A counter that cannot be written at all (say, a
+root-owned `~/.local/state`) raises a banner on every failure instead.
 
 ## Install
 

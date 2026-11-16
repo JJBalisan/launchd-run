@@ -156,7 +156,9 @@ main() {
   state="${HOME}/.local/state/launchd-run/${LABEL}"
   AUDIT="${HOME}/Library/Logs/launchd-run.log"
   readonly AUDIT
-  mkdir -p "${state}"
+  # A state directory that cannot be made is reported where the counter is
+  # written, in the audit log, not on the job's stderr.
+  mkdir -p "${state}" 2>/dev/null
   rotate_audit
 
   # One start line per run, naming the wrapper's own checkout, so an audit
@@ -216,13 +218,21 @@ main() {
     fi
   else
     fails=$((prev + 1))
-    printf '%s' "${fails}" >"${fails_file}"
-    note "FAILED exit ${code} (${elapsed}s, consecutive: ${fails})"
-    # One bad run can be a flaky network or a host mid-deploy; a pattern
-    # cannot.
-    if ((fails >= alert_after)); then
+    if { printf '%s' "${fails}" >"${fails_file}"; } 2>/dev/null; then
+      note "FAILED exit ${code} (${elapsed}s, consecutive: ${fails})"
+      # One bad run can be a flaky network or a host mid-deploy; a pattern
+      # cannot.
+      if ((fails >= alert_after)); then
+        notify "Job failing" \
+          "exit ${code} on ${fails} consecutive runs - see the log"
+      fi
+    else
+      # Without a counter the streak never reaches --after and a job that
+      # fails every run would never alert, so alert on every failure.
+      note "FAILED exit ${code} (${elapsed}s, consecutive: unknown -" \
+        "cannot write ${fails_file})"
       notify "Job failing" \
-        "exit ${code} on ${fails} consecutive runs - see the log"
+        "exit ${code}; its failure count cannot be saved - see the log"
     fi
   fi
 

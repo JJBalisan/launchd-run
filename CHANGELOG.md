@@ -19,6 +19,9 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
   takes the wrapper down with the same signal instead of an `exit 139`, so
   launchd sees a crash and `KeepAlive = { Crashed = true; }` restarts it.
   bash's own "Segmentation fault" report no longer lands on the job's stderr.
+- A failure count that cannot be saved (a root-owned or non-directory
+  `~/.local/state`) no longer leaves the streak stuck at 1 with no alert:
+  every failure then raises a banner and the audit line says why.
 
 ## [1.0.4] - 2026-11-02
 

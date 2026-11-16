@@ -563,6 +563,28 @@ test_bad_counter_file() {
       audit_has 'FAILED exit 3'
     check "counter '${content}', fail: no error noise" err_empty
   done
+
+  # ~/.local/state as a file stands in for one left root-owned by a sudo
+  # install: the counter cannot be written, so the streak would stick at 1
+  # and never reach --after.
+  echo '# state directory cannot be made'
+  new_case
+  mkdir -p "${CASE_HOME}/.local"
+  : >"${CASE_HOME}/.local/state"
+  run_wrap job -- /bin/sh -c 'exit 3'
+  check 'unwritable state, fail: job exit 3 passed through' rc_is 3
+  check 'unwritable state, fail: alerts on the first failure' calls_are 1
+  check 'unwritable state, fail: banner says the count is lost' \
+    call_has 1 'exit 3; its failure count cannot be saved - see the log'
+  check 'unwritable state, fail: audit names the counter it cannot write' \
+    audit_has 's, consecutive: unknown - cannot write'
+  check 'unwritable state, fail: no error on the job stderr' err_empty
+  run_wrap job -- /bin/sh -c 'exit 3'
+  check 'unwritable state, fail again: alerts again' calls_are 2
+  run_wrap job -- /usr/bin/true
+  check 'unwritable state, ok: exit 0' rc_is 0
+  check 'unwritable state, ok: no banner' calls_are 2
+  check 'unwritable state, ok: no error on the job stderr' err_empty
 }
 
 #######################################
