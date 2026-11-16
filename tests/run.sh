@@ -492,8 +492,12 @@ test_crash_signals() {
   for sig in 134 138 139; do
     new_case
     seed_counter job 1
-    run_wrap job -- /bin/sh -c "exit ${sig}"
+    # Through perl: the wrapper now dies of the signal (139 is SIGSEGV), and
+    # run_wrap would have this shell print its own "Segmentation fault".
+    run_wrap_raw job -- /bin/sh -c "exit ${sig}"
     check "exit ${sig}: passed through" rc_is "${sig}"
+    check "exit ${sig}: wrapper killed by signal $((sig - 128))" \
+      [ "${KILLED_BY}" = "$((sig - 128))" ]
     check "exit ${sig}: counter 1 -> 2" counter_is job 2
     check "exit ${sig}: banner at threshold" calls_are 1
     check "exit ${sig}: banner names the exit code" \
