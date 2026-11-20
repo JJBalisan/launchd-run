@@ -452,38 +452,46 @@ test_recovery() {
 
 test_stop_signals() {
   local sig
-  echo '# stop signals 129/130/137/143 are not failures'
+  # Issues #21 #22: only a signal to the wrapper makes a stop. The same codes
+  # with the wrapper never signalled are failures.
+  echo '# exit 129/130/137/143 with no signal to the wrapper: counted'
   for sig in 129 130 137 143; do
     new_case
     seed_counter job 1
     run_wrap job -- /bin/sh -c "exit ${sig}"
     check "exit ${sig}: passed through" rc_is "${sig}"
-    check "exit ${sig}: streak of 1 preserved" counter_is job 1
-    check "exit ${sig}: no banner" calls_are 0
-    check "exit ${sig}: audit says not counted" \
-      audit_has "stopped by signal (exit ${sig}, "
+    check "exit ${sig}: counted, streak 1 -> 2" counter_is job 2
+    check "exit ${sig}: banner at threshold" calls_are 1
+    check "exit ${sig}: audit FAILED line" audit_has "FAILED exit ${sig} ("
 
     new_case
     run_wrap job -- /bin/sh -c "exit ${sig}"
-    check "exit ${sig} with no streak: no counter created" counter_absent job
+    check "exit ${sig} with no streak: counter starts at 1" counter_is job 1
   done
 
+  # A real stop at the threshold: the wrapper is signalled and the job exits
+  # 1, a code the old exit-code rule would have counted.
   new_case
-  seed_counter job 2
-  run_wrap job -- /bin/sh -c 'exit 143'
-  check 'stop at threshold: streak of 2 preserved' counter_is job 2
-  check 'stop at threshold: no recovery banner' calls_are 0
-  run_wrap job -- /usr/bin/true
-  check 'stop then ok: recovery reports the preserved streak' \
-    call_has 1 'succeeded after 2 failed runs'
+  seed_counter svc 2
+  if ! stop_wrapper_with TERM \
+    "trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & wait \$!"; then
+    check 'stop at threshold: wrapper started the job' false
+  else
+    check 'stop at threshold: streak of 2 preserved' counter_is svc 2
+    check 'stop at threshold: no banner' calls_are 0
+    run_wrap svc -- /usr/bin/true
+    check 'stop then ok: recovery reports the preserved streak' \
+      call_has 1 'succeeded after 2 failed runs'
+  fi
 
   new_case
   seed_counter job 1
   run_wrap job -- /bin/sh -c 'kill -TERM $$'
   check 'child really killed by SIGTERM: exit 143' rc_is 143
-  check 'child really killed by SIGTERM: streak preserved' counter_is job 1
-  check 'child really killed by SIGTERM: not counted' \
-    audit_has 'stopped by signal (exit 143'
+  check 'child really killed by SIGTERM: counted, streak 1 -> 2' \
+    counter_is job 2
+  check 'child really killed by SIGTERM: audit FAILED line' \
+    audit_has 'FAILED exit 143 ('
 }
 
 test_crash_signals() {
@@ -677,7 +685,7 @@ test_signal_to_wrapper() {
     check "SIG${sig} to wrapper: no job-control noise on stderr" err_empty
   done
 
-  echo '# job handles SIGTERM itself and exits 0: a clean stop'
+  echo '# job handles SIGTERM itself and exits 0: a stop, streak kept'
   new_case
   seed_counter svc 1
   # sleep runs in the background so sh can act on the trap at once, and the
@@ -688,8 +696,8 @@ test_signal_to_wrapper() {
     return
   fi
   check 'clean stop: job exit 0 passed through' rc_is 0
-  check 'clean stop: logged as ok' audit_has 'ok ('
-  check 'clean stop: streak cleared' counter_absent svc
+  check 'clean stop: logged as a stop' audit_has 'stopped by signal (exit 0,'
+  check 'clean stop: streak kept' counter_is svc 1
   check 'clean stop: no banner' calls_are 0
   check 'clean stop: job gone' pid_gone "${CHILD}"
 }
