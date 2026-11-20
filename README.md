@@ -4,7 +4,7 @@ A wrapper that makes launchd job failures visible. Without it a broken job exits
 1 into a log nobody reads — which is how a weekly backup here missed two Sundays
 unnoticed.
 
-```
+```text
 launchd-run.sh LABEL [--after N] -- command [args...]
 ```
 
@@ -30,7 +30,7 @@ that cannot be cleared raises no "Back to normal" banner.
 
 Then put the wrapper in front of a job's existing `ProgramArguments`:
 
-```
+```text
 [ ~/.local/bin/launchd-run.sh, com.example.job, --after, 2, --, /bin/bash, ~/bin/job.sh ]
 ```
 
@@ -40,12 +40,17 @@ missed weekly run is already a fortnight of drift by the time it happens twice.
 
 ## Signals are not failures
 
-Exit codes 129, 130, 137 and 143 (SIGHUP, SIGINT, SIGKILL, SIGTERM) mean
-somebody stopped the job — a logout, a `launchctl kill`, a `KeepAlive` restart.
-Those are recorded and ignored: they neither raise the counter nor clear an
-existing streak. Crash signals (134 SIGABRT, 138 SIGBUS, 139 SIGSEGV) still
-count, and the wrapper then dies of the same signal rather than exiting with
-the code, so launchd still sees a crash and `KeepAlive`'s `Crashed` key works.
+A stop is recognised by the wrapper itself being signalled (SIGHUP, SIGINT or
+SIGTERM: a logout, a `launchctl kill` or `kickstart -k`, a `KeepAlive`
+restart), whatever exit code the job then returns. A stop is recorded and
+ignored: it neither raises the counter nor clears an existing streak.
+
+The exit code alone never marks a stop. A job that dies of SIGKILL or SIGTERM
+(137, 143) while the wrapper was not signalled was killed by something else
+(memory pressure, its own `timeout -s KILL`, a manual `kill -9`), and counts as
+a failure. Crash signals (134 SIGABRT, 138 SIGBUS, 139 SIGSEGV) also count, and
+the wrapper then dies of the same signal rather than exiting with the code, so
+launchd still sees a crash and `KeepAlive`'s `Crashed` key works.
 
 This matters for `KeepAlive` servers, which exit by signal in normal use.
 Without it, two ordinary restarts look identical to two crashes.
@@ -54,8 +59,8 @@ launchd stops a job by signalling its main process, which with the wrapper in
 front is the wrapper itself. The wrapper traps SIGHUP, SIGINT and SIGTERM,
 forwards SIGTERM to the command, waits for it to exit and then logs the stop
 (`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line and
-no orphaned command. A command that handles SIGTERM and exits 0 is logged as
-`ok`. One side effect: the command runs as a background job of the wrapper, so
+no orphaned command. A command that handles SIGTERM is logged as stopped
+whatever code it exits with, 0 or 1 included. One side effect: the command runs as a background job of the wrapper, so
 it starts with SIGINT and SIGQUIT ignored.
 
 ## Log rotation

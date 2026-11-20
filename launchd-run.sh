@@ -198,17 +198,17 @@ main() {
     prev=0
   fi
 
-  # 129/130/137/143 are SIGHUP/SIGINT/SIGKILL/SIGTERM: somebody stopped the
-  # job - a logout, a launchctl kill, a KeepAlive restart. That is not a
-  # failure, and it must not reset a real failure streak either, so it is
-  # recorded and ignored. Crash signals (134 SIGABRT, 138 SIGBUS, 139 SIGSEGV)
-  # still count.
-  case "${code}" in
-    129 | 130 | 137 | 143)
-      note "stopped by signal (exit ${code}, ${elapsed}s) - not counted"
-      exit "${code}"
-      ;;
-  esac
+  # A stop is known from the wrapper itself having been signalled (launchd
+  # signals the wrapper, never the job), not from the job's exit code: a job
+  # that handles SIGTERM with any code was stopped. A stop is recorded and
+  # ignored; it neither counts as a failure nor clears a real failure streak.
+  # The converse also holds: 129/130/137/143 without a signal to the wrapper
+  # (jetsam, the job's own timeout -s KILL, a manual kill -9) are failures
+  # and are counted below.
+  if [[ -n "${stopped}" ]]; then
+    note "stopped by signal (exit ${code}, ${elapsed}s) - not counted"
+    exit "${code}"
+  fi
 
   if ((code == 0)); then
     # A counter that cannot be cleared (a state directory left root-owned by
