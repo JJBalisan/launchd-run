@@ -13,6 +13,17 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-20
+
+### Changed
+
+- A run counts as a stop only when the wrapper itself was signalled (SIGHUP,
+  SIGINT, SIGTERM), not by the job's exit code. A job that dies of SIGKILL or
+  SIGTERM (137, 143) while the wrapper was not signalled, or exits with any
+  other signal code in 129..143, now counts as a failure and raises the
+  failure banner after `--after` runs, where it was silently ignored before
+  (#21, #22, #49). This changes what the wrapper counts, hence MAJOR.
+
 ### Fixed
 
 - A job that dies of a crash signal (SIGSEGV, SIGABRT, SIGBUS, ...) now
@@ -93,7 +104,8 @@ audit fixes (#8) and the single-script CI (#9).
   `tests/version.sh` for the lib; `tests/ci.sh` is the whole CI as one
   script and the workflow's only step (#9), linting every tracked `.sh`.
 
-[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/JJBalisan/launchd-run/compare/v1.0.4...v2.0.0
 [1.0.4]: https://github.com/JJBalisan/launchd-run/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/JJBalisan/launchd-run/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/JJBalisan/launchd-run/compare/v1.0.1...v1.0.2
