@@ -694,6 +694,75 @@ test_signal_to_wrapper() {
   check 'clean stop: job gone' pid_gone "${CHILD}"
 }
 
+# Issue #21: a stop is known from the wrapper being signalled, not from the
+# job's exit code. A job that handles SIGTERM with any exit code was stopped,
+# so the run must neither count nor clear a streak.
+test_stop_classified_by_wrapper() {
+  local body
+  echo '# #21: wrapper signalled, job exits 1 on SIGTERM: a stop, not counted'
+  new_case
+  seed_counter svc 1
+  body="trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & wait \$!"
+  if ! stop_wrapper_with TERM "${body}"; then
+    check '#21 exit 1 on stop: wrapper started the job' false
+  else
+    check '#21 exit 1 on stop: job exit 1 passed through' rc_is 1
+    check '#21 exit 1 on stop: streak of 1 untouched' counter_is svc 1
+    check '#21 exit 1 on stop: no banner' calls_are 0
+    check '#21 exit 1 on stop: not logged as a failure' audit_lacks 'FAILED'
+    check '#21 exit 1 on stop: job gone' pid_gone "${CHILD}"
+  fi
+  # Two routine restarts must not reach the default --after 2.
+  /bin/rm -f "${CASE_DIR}/child.pid"
+  if stop_wrapper_with TERM "${body}"; then
+    check '#21 second stop: streak of 1 still untouched' counter_is svc 1
+    check '#21 second stop: still no "Job failing" banner' calls_are 0
+  else
+    check '#21 second stop: wrapper started the job' false
+  fi
+
+  echo '# #21: wrapper signalled, job exits 0 on SIGTERM: streak kept'
+  new_case
+  seed_counter svc 5
+  body="trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & wait \$!"
+  if ! stop_wrapper_with TERM "${body}"; then
+    check '#21 exit 0 on stop: wrapper started the job' false
+    return
+  fi
+  check '#21 exit 0 on stop: job exit 0 passed through' rc_is 0
+  check '#21 exit 0 on stop: streak of 5 kept' counter_is svc 5
+  check '#21 exit 0 on stop: no "Back to normal" banner' calls_are 0
+  check '#21 exit 0 on stop: no recovery logged' audit_lacks 'Back to normal'
+  check '#21 exit 0 on stop: job gone' pid_gone "${CHILD}"
+}
+
+# Issue #22: with the wrapper in front, launchd's stops signal the wrapper.
+# A job that dies of SIGKILL or SIGTERM while the wrapper was not signalled
+# (jetsam, its own timeout -s KILL, a manual kill) failed, and counts.
+test_unexplained_signal_deaths() {
+  local sig code
+  echo '# #22: job killed by a signal the wrapper never got: counted'
+  for sig in KILL TERM; do
+    code=$((128 + $(kill -l "${sig}")))
+    new_case
+    seed_counter job 1
+    run_wrap job -- /bin/sh -c "kill -${sig} \$\$"
+    check "#22 SIG${sig} unexplained: exit ${code} passed through" \
+      rc_is "${code}"
+    check "#22 SIG${sig} unexplained: counter 1 -> 2" counter_is job 2
+    check "#22 SIG${sig} unexplained: banner at threshold" calls_are 1
+    check "#22 SIG${sig} unexplained: banner names exit ${code}" \
+      call_has 1 "exit ${code} on 2 consecutive runs"
+    check "#22 SIG${sig} unexplained: not logged as not counted" \
+      audit_lacks 'not counted'
+
+    new_case
+    run_wrap job -- /bin/sh -c "kill -${sig} \$\$"
+    check "#22 SIG${sig} unexplained, no streak: counter starts at 1" \
+      counter_is job 1
+  done
+}
+
 test_log_rotation() {
   echo '# audit log trimmed to its last 5000 lines once past 1 MB'
   new_case
@@ -743,6 +812,8 @@ main() {
   test_crash_signals
   test_bad_counter_file
   test_signal_to_wrapper
+  test_stop_classified_by_wrapper
+  test_unexplained_signal_deaths
   test_log_rotation
 
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
