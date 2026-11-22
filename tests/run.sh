@@ -1062,6 +1062,422 @@ test_log_rotation() {
   check 'no rotation: nothing about a trim' audit_lacks 'trimmed'
 }
 
+# --- lr-stop: issues #27, #37, #25 and #41. ---------------------------------
+# A check described "lr-stop:" fails on the wrapper these issues were filed
+# against; one described "lr-stop-guard:" passes on it and must keep passing.
+
+# Read by lr_stop_start: a directory to put first on PATH, and the command
+# (and, if not empty, the first argument) that the gate stub there holds.
+LR_PATH_PREFIX=''
+LR_GATE_CMD=''
+LR_GATE_ARG=''
+# Set by lr_stop_start.
+LR_WPID=''
+LR_LAUNCHER=''
+
+# Polls until a file exists and is not empty, for up to ~20 s.
+lr_stop_wait_for() {
+  local i=0
+  while [ ! -s "$1" ] && [ "${i}" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -s "$1" ]
+}
+
+# Lines in a file, 0 if it is missing.
+lr_stop_lines() {
+  if [ -f "$1" ]; then
+    wc -l <"$1" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+# Polls until a file holds at least N lines, for up to ~20 s.
+lr_stop_wait_lines() {
+  local i=0
+  while [ "$(lr_stop_lines "$1")" -lt "$2" ] && [ "${i}" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(lr_stop_lines "$1")" -ge "$2" ]
+}
+
+lr_stop_lines_are() { [ "$(lr_stop_lines "$1")" -eq "$2" ]; }
+lr_stop_file_is() { [ "$(cat "$1" 2>/dev/null)" = "$2" ]; }
+lr_stop_not_killed() { [ "${KILLED_BY}" = 0 ]; }
+# The wrapper exited with this status rather than being killed by a signal.
+lr_stop_exited_with() { [ "${KILLED_BY}" = 0 ] && rc_is "$1"; }
+lr_stop_source_lacks() { ! grep -F -q -- "$1" "${WRAPPER}"; }
+lr_stop_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+
+#######################################
+# Writes the case's job script (sh). It is run with one argument, the pid
+# file $CASE_DIR/child.pid, and writes its pid there once its traps are set.
+# Arguments:
+#   The body of the script.
+#######################################
+lr_stop_job() {
+  printf '#!/bin/sh\n%s\n' "$1" >"${CASE_DIR}/job.sh"
+  chmod +x "${CASE_DIR}/job.sh"
+}
+
+#######################################
+# Puts a gate in front of a command the wrapper runs before it forks the job.
+# The first call of it (with the given first argument, if one is given)
+# writes $CASE_DIR/ready and holds until $CASE_DIR/go exists (~20 s at most),
+# then runs the real command, so a signal sent while it holds reaches the
+# wrapper at a known point.
+# Globals:
+#   LR_PATH_PREFIX, LR_GATE_CMD, LR_GATE_ARG (set)
+# Arguments:
+#   The command (one that lives in /bin), then its first argument or ''.
+#######################################
+lr_stop_gate() {
+  local dir="${CASE_DIR}/gate"
+  mkdir -p "${dir}"
+  # shellcheck disable=SC2016  # Expanded by the gate, not here.
+  printf '%s\n' '#!/bin/bash' \
+    'n="${0##*/}" g="${LR_G_DIR}"' \
+    'if [ "${n}" = "${LR_G_CMD}" ] && [ ! -e "${g}/ready" ]; then' \
+    '  if [ -n "${LR_G_ARG}" ] && [ "${1:-}" != "${LR_G_ARG}" ]; then' \
+    '    exec "/bin/${n}" "$@"' \
+    '  fi' \
+    '  echo held >"${g}/ready"' \
+    '  i=0' \
+    '  while [ ! -e "${g}/go" ] && [ "${i}" -lt 200 ]; do' \
+    '    /bin/sleep 0.1' \
+    '    i=$((i + 1))' \
+    '  done' \
+    'fi' \
+    'exec "/bin/${n}" "$@"' >"${dir}/$1"
+  chmod +x "${dir}/$1"
+  LR_PATH_PREFIX="${dir}"
+  LR_GATE_CMD="$1"
+  LR_GATE_ARG="$2"
+}
+
+#######################################
+# Starts the wrapper in the background the way launchd does: with SIGINT and
+# SIGQUIT at their defaults (a shell starts its background jobs with both
+# ignored), through a perl launcher that writes the wrapper's pid to
+# $CASE_DIR/wrapper.pid and, once it ends, the signal that killed it (0 for
+# none) to $CASE_DIR/killed-by.
+# Globals:
+#   LR_LAUNCHER (set to the launcher's pid)
+#   LR_WPID (set to the wrapper's pid, or empty if it never started)
+#   LR_PATH_PREFIX, LR_GATE_CMD, LR_GATE_ARG (read)
+# Arguments:
+#   Arguments for launchd-run.sh.
+#######################################
+lr_stop_start() {
+  /bin/rm -f "${CASE_DIR}/wrapper.pid" "${CASE_DIR}/killed-by"
+  # shellcheck disable=SC2016  # $SIG, $p, $s and the rest belong to perl.
+  env HOME="${CASE_HOME}" \
+    PATH="${LR_PATH_PREFIX:+${LR_PATH_PREFIX}:}${STUB_BIN}:${SYS_PATH}" \
+    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
+    REPO_VERSION="${TEST_VERSION}" LR_G_DIR="${CASE_DIR}" \
+    LR_G_CMD="${LR_GATE_CMD}" LR_G_ARG="${LR_GATE_ARG}" \
+    /usr/bin/perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT";
+      my ($pf, $kf) = splice(@ARGV, 0, 2);
+      my $p = fork();
+      defined($p) or die;
+      if ($p == 0) { exec { $ARGV[0] } @ARGV; exit 127; }
+      open(my $h, ">", "$pf.new") or die;
+      print $h "$p\n";
+      close($h);
+      rename("$pf.new", $pf) or die;
+      waitpid($p, 0);
+      my $s = $?;
+      open($h, ">", $kf) or die;
+      print $h ($s & 127);
+      close($h);
+      exit(($s & 127) ? 128 + ($s & 127) : $s >> 8)' \
+    "${CASE_DIR}/wrapper.pid" "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
+    >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
+  LR_LAUNCHER=$!
+  LR_WPID=''
+  if lr_stop_wait_for "${CASE_DIR}/wrapper.pid"; then
+    LR_WPID="$(cat "${CASE_DIR}/wrapper.pid")"
+  fi
+}
+
+#######################################
+# Waits for the wrapper lr_stop_start began, SIGKILLing it if it is still
+# there after the given number of seconds.
+# Globals:
+#   RC (set to the wrapper's exit status, or 128+N when killed by signal N)
+#   KILLED_BY (set to the signal number that killed the wrapper, or 0)
+# Arguments:
+#   The limit in seconds.
+#######################################
+lr_stop_finish() {
+  local limit="$1" t0="${SECONDS}"
+  while kill -0 "${LR_LAUNCHER}" 2>/dev/null; do
+    if ((SECONDS - t0 >= limit)); then
+      if [ -n "${LR_WPID}" ]; then
+        kill -KILL "${LR_WPID}" 2>/dev/null
+      fi
+      break
+    fi
+    sleep 0.1
+  done
+  wait "${LR_LAUNCHER}" 2>/dev/null
+  RC=$?
+  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+}
+
+# Kills the case's job if it is still running (the unfixed wrapper orphans
+# it) and queues it for the suite's cleanup too.
+lr_stop_reap() {
+  local child
+  child="$(cat "${CASE_DIR}/child.pid" 2>/dev/null)"
+  if [ -n "${child}" ]; then
+    kill -KILL "${child}" 2>/dev/null
+    leftover_pids="${leftover_pids} ${child}"
+  fi
+}
+
+# Starts the case's job under the wrapper and waits until it is up, then
+# gives the wrapper a moment to reach its wait, as launchd_stop does.
+lr_stop_start_job() {
+  lr_stop_start svc "$@" -- "${CASE_DIR}/job.sh" "${CASE_DIR}/child.pid"
+  lr_stop_wait_for "${CASE_DIR}/child.pid" || return 1
+  sleep 1
+}
+
+# Issue #27: a stop that lands after the arguments are parsed but before the
+# job is forked is not lost and does not kill the wrapper: the job is not
+# started, the stop is logged and the streak is left alone.
+test_lr_stop_27() {
+  local spec cmd arg sig code marker what killed lost
+  echo '# lr-stop #27: a stop before the job is forked'
+  for spec in mkdir::TERM mkdir::HUP mkdir::INT date:+%s:TERM; do
+    IFS=: read -r cmd arg sig <<<"${spec}"
+    code=$((128 + $(kill -l "${sig}")))
+    what="#27 SIG${sig} during ${cmd}${arg:+ ${arg}}"
+    # Unfixed, TERM and HUP kill the wrapper. bash 3.2 outlives an INT that
+    # lands while it waits for a command, so INT is lost instead: the job
+    # runs as if nothing had happened.
+    killed='lr-stop:'
+    lost='lr-stop-guard:'
+    if [ "${sig}" = INT ]; then
+      killed='lr-stop-guard:'
+      lost='lr-stop:'
+    fi
+    new_case
+    seed_counter svc 1
+    marker="${CASE_DIR}/ran"
+    lr_stop_gate "${cmd}" "${arg}"
+    lr_stop_start svc -- /usr/bin/touch "${marker}"
+    if ! lr_stop_wait_for "${CASE_DIR}/ready"; then
+      check "lr-stop-guard: ${what}: wrapper reached the gate" false
+      : >"${CASE_DIR}/go"
+      lr_stop_finish 20
+    else
+      kill "-${sig}" "${LR_WPID}"
+      : >"${CASE_DIR}/go"
+      lr_stop_finish 20
+      check "${killed} ${what}: wrapper not killed by it" lr_stop_not_killed
+      check "lr-stop: ${what}: exits ${code}" lr_stop_exited_with "${code}"
+      check "lr-stop: ${what}: logged as a stop before the job started" \
+        audit_has 'stopped by signal before the job started - not counted'
+      check "${lost} ${what}: job not started" path_absent "${marker}"
+      check "${lost} ${what}: streak of 1 untouched" counter_is svc 1
+      check "lr-stop-guard: ${what}: no banner" calls_are 0
+    fi
+    LR_PATH_PREFIX=''
+    LR_GATE_CMD=''
+    LR_GATE_ARG=''
+  done
+}
+
+# Issue #37: USR1, USR2 and ALRM are passed to the job as themselves and the
+# wrapper keeps waiting; PIPE and QUIT are ignored by the wrapper. None of
+# them ends the wrapper or loses the outcome line.
+test_lr_stop_37() {
+  local sig word
+  echo '# lr-stop #37: USR1, USR2 and ALRM reach the job as themselves'
+  for sig in USR1 USR2 ALRM; do
+    new_case
+    lr_stop_job "trap 'echo ${sig} >\"\$1.got\"; exit 3' ${sig}
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+    if ! lr_stop_start_job; then
+      check "lr-stop-guard: #37 SIG${sig}: wrapper started the job" false
+      lr_stop_finish 0
+    else
+      kill "-${sig}" "${LR_WPID}"
+      lr_stop_finish 20
+      check "lr-stop: #37 SIG${sig}: the job got SIG${sig}" \
+        lr_stop_file_is "${CASE_DIR}/child.pid.got" "${sig}"
+      check "lr-stop: #37 SIG${sig}: wrapper not killed by it" \
+        lr_stop_not_killed
+      check "lr-stop: #37 SIG${sig}: the job's exit 3 passed through" \
+        lr_stop_exited_with 3
+      check "lr-stop: #37 SIG${sig}: outcome logged" audit_has 'exit 3'
+    fi
+    lr_stop_reap
+  done
+
+  echo '# lr-stop #37: PIPE and QUIT do not end the wrapper'
+  for sig in PIPE QUIT; do
+    new_case
+    lr_stop_job "echo \$\$ >\"\$1\"
+while [ ! -e \"\$1.go\" ]; do /bin/sleep 0.1; done
+exit 7"
+    if ! lr_stop_start_job; then
+      check "lr-stop-guard: #37 SIG${sig}: wrapper started the job" false
+      lr_stop_finish 0
+    else
+      kill "-${sig}" "${LR_WPID}"
+      : >"${CASE_DIR}/child.pid.go"
+      lr_stop_finish 20
+      check "lr-stop: #37 SIG${sig}: wrapper not killed by it" \
+        lr_stop_not_killed
+      check "lr-stop: #37 SIG${sig}: the job's exit 7 passed through" \
+        lr_stop_exited_with 7
+      check "lr-stop: #37 SIG${sig}: outcome logged" \
+        audit_has 'FAILED exit 7 ('
+    fi
+    lr_stop_reap
+  done
+
+  echo '# lr-stop #37: a USR1 while a stopped job shuts down is passed on'
+  new_case
+  lr_stop_job "trap 'echo TERM >>\"\$1.terms\"' TERM
+trap 'echo USR1 >\"\$1.got\"; exit 4' USR1
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job; then
+    check 'lr-stop-guard: #37 USR1 after a stop: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    if ! lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1; then
+      check 'lr-stop-guard: #37 USR1 after a stop: SIGTERM forwarded' false
+    fi
+    kill -USR1 "${LR_WPID}" 2>/dev/null
+    lr_stop_finish 20
+    check 'lr-stop: #37 USR1 after a stop: the job got SIGUSR1' \
+      lr_stop_file_is "${CASE_DIR}/child.pid.got" USR1
+    check "lr-stop: #37 USR1 after a stop: the job's exit 4 passed through" \
+      lr_stop_exited_with 4
+    check 'lr-stop: #37 USR1 after a stop: logged as a stop' \
+      audit_has 'stopped by signal (exit 4,'
+  fi
+  lr_stop_reap
+
+  # The wrapper may ignore PIPE, but the job must not inherit that: a job
+  # that writes to a closed pipe dies of it, as it would without the wrapper.
+  new_case
+  run_wrap job -- /bin/sh -c 'kill -PIPE $$; exit 0'
+  check 'lr-stop-guard: #37 the job starts with SIGPIPE at its default' \
+    rc_is 141
+
+  for word in USR1 USR2 ALRM PIPE STOP; do
+    check "lr-stop: #37 README says what SIG${word} does" \
+      lr_stop_readme_has "${word}"
+  done
+}
+
+# Issue #25: after a stop the wrapper waits for the job, however many more
+# stops arrive (each forwarded as SIGTERM again), and logs and returns the
+# job's own status, a death by signal included. --kill-after still ends the
+# wait at its deadline.
+test_lr_stop_25() {
+  local child
+  echo '# lr-stop #25: three stops while the job shuts down'
+  new_case
+  seed_counter svc 1
+  lr_stop_job "n=0
+log=\"\$HOME/Library/Logs/launchd-run.log\"
+trap 'n=\$((n + 1)); echo TERM >>\"\$1.terms\"
+if [ \"\$n\" -ge 3 ]; then
+  grep -q \"stopped by signal\" \"\$log\" && echo early >\"\$1.early\"
+  exit 5
+fi' TERM
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job; then
+    check 'lr-stop-guard: #25 three stops: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1
+    kill -HUP "${LR_WPID}" 2>/dev/null
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 2
+    kill -INT "${LR_WPID}" 2>/dev/null
+    lr_stop_finish 20
+    check 'lr-stop: #25 three stops: each forwarded, three SIGTERMs' \
+      lr_stop_lines_are "${CASE_DIR}/child.pid.terms" 3
+    check "lr-stop: #25 three stops: the job's exit 5 passed through" \
+      lr_stop_exited_with 5
+    check "lr-stop: #25 three stops: logged with the job's exit 5" \
+      audit_has 'stopped by signal (exit 5,'
+    check 'lr-stop-guard: #25 three stops: no outcome before the job ended' \
+      path_absent "${CASE_DIR}/child.pid.early"
+    check 'lr-stop-guard: #25 three stops: streak of 1 untouched' \
+      counter_is svc 1
+    check 'lr-stop-guard: #25 three stops: no banner' calls_are 0
+  fi
+  lr_stop_reap
+
+  echo '# lr-stop #25: the job dies of SIGKILL after a second stop'
+  new_case
+  lr_stop_job "trap 'echo TERM >>\"\$1.terms\"' TERM
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job; then
+    check 'lr-stop-guard: #25 death by signal: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1
+    kill -TERM "${LR_WPID}" 2>/dev/null
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 2
+    # No stop after this: one just after a death by signal is issue #52.
+    child="$(cat "${CASE_DIR}/child.pid")"
+    kill -KILL "${child}"
+    lr_stop_finish 20
+    check "lr-stop: #25 death by signal: the job's 137 passed through" \
+      lr_stop_exited_with 137
+    check "lr-stop: #25 death by signal: logged with the job's 137" \
+      audit_has 'stopped by signal (exit 137,'
+  fi
+  lr_stop_reap
+
+  echo '# lr-stop #25: with --kill-after a second stop keeps the deadline'
+  new_case
+  lr_stop_job "trap 'echo TERM >>\"\$1.terms\"' TERM
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job --kill-after 2; then
+    check 'lr-stop-guard: #25 --kill-after: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1
+    kill -HUP "${LR_WPID}" 2>/dev/null
+    lr_stop_finish 30
+    check 'lr-stop-guard: #25 --kill-after: killed at the deadline, 137' \
+      lr_stop_exited_with 137
+    check 'lr-stop-guard: #25 --kill-after: the SIGKILL is logged' \
+      audit_has 'stopped by signal, SIGKILL after 2s (exit 137, '
+    check 'lr-stop-guard: #25 --kill-after: job gone' \
+      pid_gone "$(cat "${CASE_DIR}/child.pid")"
+  fi
+  lr_stop_reap
+}
+
+# Issue #41: without set -e, the "|| true" after the label's shift is dead.
+test_lr_stop_41() {
+  echo '# lr-stop #41: the label shift'
+  check 'lr-stop: #41 the dead "shift || true" is gone' \
+    lr_stop_source_lacks 'shift || true'
+}
+
 main() {
   if [ ! -x "${WRAPPER}" ]; then
     echo "run.sh: wrapper not found or not executable: ${WRAPPER}" >&2
@@ -1089,6 +1505,10 @@ main() {
   test_kill_after_arguments
   test_kill_deadline
   test_log_rotation
+  test_lr_stop_27
+  test_lr_stop_37
+  test_lr_stop_25
+  test_lr_stop_41
 
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]
