@@ -45,6 +45,9 @@ the record to check; `alert FAILED` there means `osascript` exited non-zero.
 
 ## Install
 
+macOS 12.3 or later is required: the wrapper and `lib/version.sh` call
+`/usr/bin/readlink -f`.
+
 ```sh
 ./install.sh
 ```
@@ -55,11 +58,9 @@ Then put the wrapper in front of a job's existing `ProgramArguments`:
 [ ~/.local/bin/launchd-run.sh, com.example.job, --after, 2, --, /bin/bash, ~/bin/job.sh ]
 ```
 
-and `launchctl bootout` + `bootstrap` that agent. macOS 12.3 or later is
-required: the wrapper and `lib/version.sh` call `/usr/bin/readlink -f`. Daily
-jobs suit `--after 2` (one flaky network night is not news); weekly ones suit
-`--after 1`, since a missed weekly run is already a fortnight of drift by the
-time it happens twice.
+and `launchctl bootout` + `bootstrap` that agent. Daily jobs suit `--after 2`
+(one flaky network night is not news); weekly ones suit `--after 1`, since a
+missed weekly run is already a fortnight of drift by the time it happens twice.
 
 ## Signals are not failures
 
