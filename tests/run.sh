@@ -39,6 +39,8 @@ leftover_pids=''
 CASE_HOME=''
 CASE_DIR=''
 RC=0
+# Read by launchd_stop: a SECONDS for the wrapper to inherit, if not empty.
+WRAPPER_SECONDS=''
 
 #######################################
 # Kills any job process a test left behind and removes the temp tree.
@@ -783,6 +785,7 @@ test_unexplained_signal_deaths() {
 #   WRAPPER_KILLED (set to 1 if the stand-in had to SIGKILL the wrapper)
 #   STOP_SECONDS (set to the whole seconds from SIGTERM to the wrapper's end)
 #   STOP_MS (set to the same span in milliseconds, never understated)
+#   WRAPPER_SECONDS (read: if not empty, the wrapper inherits it as SECONDS)
 # Arguments:
 #   The stand-in's ExitTimeOut in seconds, the body of the job script (sh; it
 #   must write its pid to $1 once it is ready), then any wrapper options.
@@ -799,6 +802,7 @@ launchd_stop() {
   env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
     OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
     REPO_VERSION="${TEST_VERSION}" \
+    ${WRAPPER_SECONDS:+"SECONDS=${WRAPPER_SECONDS}"} \
     "${WRAPPER}" svc "$@" -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
@@ -845,6 +849,7 @@ now_ms() {
 }
 
 stop_took_ms_at_least() { [ "${STOP_MS}" -ge "$1" ]; }
+stop_took_ms_at_most() { [ "${STOP_MS}" -le "$1" ]; }
 wrapper_killed() { [ "${WRAPPER_KILLED}" -eq 1 ]; }
 wrapper_not_killed() { [ "${WRAPPER_KILLED}" -eq 0 ]; }
 stop_took_at_least() { [ "${STOP_SECONDS}" -ge "$1" ]; }
@@ -957,6 +962,8 @@ test_kill_deadline() {
     check '#24 deadline: job had its 2 s first' stop_took_at_least 2
     check '#24 deadline: and not a moment less than 2 s' \
       stop_took_ms_at_least 2000
+    # Due inside 3 s by the clock; the rest is room for a loaded machine.
+    check '#24 deadline: and no more than 10 s' stop_took_ms_at_most 10000
     check '#24 deadline: exit 137 passed through' rc_is 137
     check '#24 deadline: outcome line names the SIGKILL' \
       audit_has 'stopped by signal, SIGKILL after 2s (exit 137, '
@@ -967,6 +974,27 @@ test_kill_deadline() {
     check '#24 deadline: no banner' calls_are 0
     check '#24 deadline: no job-control noise on stderr' err_empty
   fi
+
+  echo '# #24: a SECONDS the wrapper inherits cannot bring the deadline forward'
+  new_case
+  body="trap '' TERM; echo \$\$ >\"\$1\"; exec /bin/sleep 120"
+  # Six below the top of bash's arithmetic. Once the wrapper has run for a
+  # second, a 5 s deadline and its extra tick added to that wrap round to
+  # the past, and the job would be killed the moment it is stopped. (After
+  # seven seconds SECONDS itself has wrapped and the case shows nothing.)
+  WRAPPER_SECONDS=9223372036854775801
+  if ! launchd_stop 20 "${body}" --kill-after 5; then
+    check '#24 inherited SECONDS: wrapper started the job' false
+  else
+    check '#24 inherited SECONDS: job still had its 5 s' \
+      stop_took_ms_at_least 5000
+    check '#24 inherited SECONDS: killed at the deadline all the same' \
+      audit_has 'stopped by signal, SIGKILL after 5s (exit 137, '
+    check '#24 inherited SECONDS: wrapper done before the launcher SIGKILL' \
+      wrapper_not_killed
+    check '#24 inherited SECONDS: job gone' pid_gone "${CHILD}"
+  fi
+  WRAPPER_SECONDS=''
 
   echo '# #24: job shuts down within the deadline: not killed, no waiting'
   new_case
