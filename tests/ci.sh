@@ -30,8 +30,12 @@ git ls-files '*.sh' | xargs shellcheck
 bash tests/version.sh
 bash tests/run.sh
 bash tests/lr_stop_select_signals.sh
+bash tests/lr_env_s3_boundary.sh
+bash tests/lr_env_select_env.sh
 
 # step: Tests (/bin/bash 3.2, as launchd runs it)
 /bin/bash tests/version.sh
 /bin/bash tests/run.sh
 /bin/bash tests/lr_stop_select_signals.sh
+/bin/bash tests/lr_env_s3_boundary.sh
+/bin/bash tests/lr_env_select_env.sh
