@@ -601,8 +601,9 @@ test_bad_counter_file() {
   check 'unwritable state, ok: no error on the job stderr' err_empty
 
   # A streak left in a directory the wrapper cannot write to (root-owned
-  # after a sudo run) cannot be cleared, so a success must not claim a
-  # recovery that the next run would claim again.
+  # after a sudo run) cannot be removed. The counter file itself can still be
+  # written here, so the count is reset to 0 instead and the recovery is
+  # reported once (#48).
   echo '# fail count that cannot be cleared'
   new_case
   seed_counter job 2
@@ -613,7 +614,8 @@ test_bad_counter_file() {
   else
     run_wrap job -- /usr/bin/true
     check 'uncleared count, ok: exit 0' rc_is 0
-    check 'uncleared count, ok: no recovery banner' calls_are 0
+    check 'uncleared count, ok: recovery banner once the count is reset' \
+      calls_are 1
     check 'uncleared count, ok: audit names the counter it cannot clear' \
       audit_has 's) - cannot clear'
     check 'uncleared count, ok: no error on the job stderr' err_empty
