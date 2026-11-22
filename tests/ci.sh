@@ -29,7 +29,9 @@ git ls-files '*.sh' | xargs shellcheck
 # step: Tests (bash on PATH)
 bash tests/version.sh
 bash tests/run.sh
+bash tests/lr_stop_select_signals.sh
 
 # step: Tests (/bin/bash 3.2, as launchd runs it)
 /bin/bash tests/version.sh
 /bin/bash tests/run.sh
+/bin/bash tests/lr_stop_select_signals.sh
