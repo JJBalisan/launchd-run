@@ -19,8 +19,8 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
   SIGTERM. launchd's SIGKILL after `ExitTimeOut` hits the wrapper alone, which
   left such a job running as an orphan with no outcome line (#24). With the
   option, a job still running `SECONDS` seconds after the wrapper forwarded
-  SIGTERM is sent SIGKILL by the wrapper (within the second that follows),
-  reaped and logged as
+  SIGTERM is sent SIGKILL by the wrapper (never sooner, about a second later
+  at the most), reaped and logged as
   `stopped by signal, SIGKILL after Ns (exit 137, ...) - not counted`. Set it
   a few seconds below the plist's `ExitTimeOut`. `SECONDS` is a positive
   integer of at most 9 digits. Without the option nothing changes.

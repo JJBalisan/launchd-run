@@ -79,8 +79,8 @@ the process group afterwards sends only one more SIGTERM (seen on macOS 27.0.1,
 
 `--kill-after SECONDS` gives the wrapper a deadline of its own. If the command
 is still running `SECONDS` seconds after the wrapper forwarded SIGTERM, the
-wrapper sends it SIGKILL (within the second that follows, never sooner), reaps
-it, logs
+wrapper sends it SIGKILL (never sooner, and about a second later at the most),
+reaps it, logs
 
 ```text
 stopped by signal, SIGKILL after 15s (exit 137, 86400s) - not counted
@@ -101,9 +101,10 @@ goes with `<key>ExitTimeOut</key><integer>20</integer>` in the same plist.
 - `SECONDS` is a positive integer of at most 9 digits; anything else is a
   usage error (exit 64) and the command is not run.
 - It must be below the plist's `ExitTimeOut` by a few seconds: the SIGKILL can
-  land up to a second after `SECONDS`, and the wrapper then needs a moment to
-  reap the command and write its line. At or above `ExitTimeOut` the option
-  does nothing, because launchd kills the wrapper first.
+  land a little over a second after `SECONDS` (the wrapper's clock ticks in
+  whole seconds and it looks ten times a second), and the wrapper then needs a
+  moment to reap the command and write its line. At or above `ExitTimeOut` the
+  option does nothing, because launchd kills the wrapper first.
 - Set `ExitTimeOut` in the plist rather than relying on the default, which
   `man launchd.plist` only calls "system-defined". The wrapper cannot read the
   plist, which is why it is told the number.

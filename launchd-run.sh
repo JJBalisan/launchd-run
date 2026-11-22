@@ -121,10 +121,12 @@ notify() {
 # job has exited, or sends it SIGKILL when the deadline passes first. The
 # deadline is read off SECONDS, bash's clock, not counted in polls, so it
 # holds on a loaded machine. SECONDS ticks in whole seconds, so one tick more
-# than asked is waited for: the job gets its full time and up to a second
-# over, never less. The caller reaps the job, under the same stderr redirect
-# as this call: bash reports a job killed by a signal on stderr at whichever
-# command it runs next after the job has died.
+# than asked is waited for: the job gets its full time, never less, and up to
+# a second more, plus one poll. The caller reaps the job, under the same
+# stderr redirect as this call: bash reports a job killed by a signal on
+# stderr at whichever command it runs next after the job has died.
+# Globals:
+#   SECONDS (restarted from zero)
 # Arguments:
 #   The job's pid, then the deadline in whole seconds (at most 9 digits, so
 #   the sum below cannot wrap).
@@ -133,7 +135,11 @@ notify() {
 #######################################
 kill_at_deadline() {
   local job="$1"
-  local deadline=$((SECONDS + $2 + 1))
+  local deadline=$(($2 + 1))
+  # Counted from zero, not added to SECONDS as it stands: a SECONDS inherited
+  # from the environment can be large enough to wrap the sum round to the
+  # past, and the job would be killed the moment it is stopped.
+  SECONDS=0
   while kill -0 "${job}"; do
     if ((SECONDS >= deadline)); then
       # From here no stop may interrupt the reap: a stop that lands just
