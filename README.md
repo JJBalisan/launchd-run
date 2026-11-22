@@ -24,6 +24,15 @@ that cannot be cleared raises no "Back to normal" banner. `--kill-after` is
 for a command that ignores SIGTERM; see
 ["A command that ignores SIGTERM"](#a-command-that-ignores-sigterm).
 
+The command runs in the environment the wrapper was started with, whatever
+names the wrapper uses inside, and is looked up on `PATH` like any program, so
+a command called `note` or `main` is the program, not one of the wrapper's
+functions. A job that has no `HOME` (a LaunchDaemon without `UserName`) gets no
+bookkeeping: the wrapper prints one warning line on stderr and runs the command
+directly, with no audit line, no counter and no banner, and exits with the
+command's status. An empty `HOME` counts as none. Banners need a login session
+as well, so a job outside one never raises them.
+
 ## Install
 
 ```sh

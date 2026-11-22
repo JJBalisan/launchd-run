@@ -29,6 +29,22 @@
 
 set -uo pipefail
 
+# The job gets the environment the wrapper was started with. The wrapper
+# assigns many names of its own, and one the caller also exported would reach
+# the job with the wrapper's value, so the caller's values of them are taken
+# here, before the first assignment, and put back by exec_job. Only names the
+# caller set are put back: an unset one stays unset. Keep the list in step
+# with every global and every local of main (tests/lr_env_s3_names.sh checks).
+launchd_run_job_env=(/usr/bin/env --)
+for launchd_run_name in REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES \
+  AUDIT_KEEP_LINES alert_after kill_after state fails_file prev fails started \
+  pid stopped code elapsed sig killed woke deadline_done; do
+  if [[ -n "${!launchd_run_name+x}" ]]; then
+    launchd_run_job_env+=("${launchd_run_name}=${!launchd_run_name}")
+  fi
+done
+unset launchd_run_name
+
 # Names the checkout this run comes from, resolved through the installed
 # symlink; "unknown" if the wrapper was copied out of the repo. Sourced
 # before anything else so $0 still resolves.
@@ -48,6 +64,23 @@ readonly AUDIT_KEEP_LINES=5000
 # Set once the arguments are parsed; read by note() and notify().
 LABEL=''
 AUDIT=''
+
+#######################################
+# Replaces the calling process with the job, in the caller's environment.
+# The program is found on PATH by env, never among the wrapper's functions.
+# env reads any argument with an "=" as an assignment, so such a command
+# goes through a bash that execs it instead.
+# Globals:
+#   launchd_run_job_env
+# Arguments:
+#   The command and its arguments.
+#######################################
+exec_job() {
+  if [[ "$1" == *=* ]]; then
+    exec "${launchd_run_job_env[@]}" /bin/bash -c 'exec "$@"' launchd-run "$@"
+  fi
+  exec "${launchd_run_job_env[@]}" "$@"
+}
 
 #######################################
 # Reports a malformed command line on stderr and exits with EX_USAGE.
@@ -228,6 +261,15 @@ main() {
     usage_error 'no command given'
   fi
 
+  # Without a HOME there is nowhere to keep the audit log or the counter (a
+  # LaunchDaemon without UserName has none), so the job runs as it is: no
+  # bookkeeping, no banner, and the wrapper's status is the job's. An empty
+  # HOME counts as none.
+  if [[ -z "${HOME:-}" ]]; then
+    echo 'launchd-run: HOME is not set; running the job without bookkeeping' >&2
+    exec_job "$@"
+  fi
+
   # The stop traps go in before anything is forked, so that a stop at any
   # later point is recorded and never takes its default action, which would
   # kill the wrapper and orphan the job. They hold the signal number for the
@@ -270,7 +312,7 @@ main() {
   # ignored, and the job inherits that. launchd stops a job with SIGTERM and
   # then, once ExitTimeOut has passed, SIGKILL; the SIGKILL hits the wrapper
   # alone and cannot be trapped, which is what --kill-after is for.
-  "$@" <&0 &
+  exec_job "$@" <&0 &
   pid=$!
   trap '' PIPE
   # A stop that came after the check above but before the pid was known was
