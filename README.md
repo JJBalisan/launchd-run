@@ -63,8 +63,25 @@ forwards SIGTERM to the command, waits for it to exit and then logs the stop
 (`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line and
 no orphaned command, provided the command exits on SIGTERM (the next section
 covers one that does not). A command that handles SIGTERM is logged as stopped
-whatever code it exits with, 0 or 1 included. One side effect: the command runs as a background job of the wrapper, so
-it starts with SIGINT and SIGQUIT ignored.
+whatever code it exits with, 0 or 1 included. Further SIGHUP, SIGINT or
+SIGTERM during the shutdown are forwarded as SIGTERM again; the wrapper logs
+and exits only once the command has exited, with the command's own status.
+The traps are in place before the command is forked. A stop that arrives
+before it has started means it is never started: the wrapper logs
+`stopped by signal before the job started - not counted`, leaves the counter
+alone and exits with 128 plus the signal number.
+
+Other signals sent to the wrapper do not end it either:
+
+- SIGUSR1, SIGUSR2 and SIGALRM are passed on to the command as themselves, and
+  the wrapper keeps waiting.
+- SIGPIPE is ignored by the wrapper (the command keeps its default).
+- SIGQUIT is ignored by the wrapper, as it is by the command (below).
+- SIGSTOP cannot be trapped: it pauses only the wrapper, not the command, and
+  the wrapper carries on when it is continued.
+
+One side effect: the command runs as a background job of the wrapper, so it
+starts with SIGINT and SIGQUIT ignored.
 
 ## A command that ignores SIGTERM
 
@@ -111,10 +128,8 @@ goes with `<key>ExitTimeOut</key><integer>20</integer>` in the same plist.
 - The SIGKILL goes to the command's own pid, as the forwarded SIGTERM does.
   Processes the command started are not signalled
   ([#44](https://github.com/JJBalisan/launchd-run/issues/44)).
-- The deadline starts when the wrapper, already waiting on the command, is
-  signalled. A stop in the first instant of a run, before the wrapper waits,
-  is not covered
-  ([#27](https://github.com/JJBalisan/launchd-run/issues/27)).
+- The deadline starts when the wrapper first sees the stop, and is not
+  restarted by later signals.
 
 ## Log rotation
 

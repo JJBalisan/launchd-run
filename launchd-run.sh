@@ -11,7 +11,10 @@
 # Under launchd the wrapper is the job's main process, so a stop (launchctl
 # kill, bootout, logout, a KeepAlive restart) signals the wrapper, not the
 # command. SIGHUP, SIGINT and SIGTERM are therefore forwarded to the command
-# as SIGTERM, and the stop is logged once the command has exited.
+# as SIGTERM, and the stop is logged once the command has exited, however many
+# more arrive meanwhile. SIGUSR1, SIGUSR2 and SIGALRM are forwarded as
+# themselves, and SIGPIPE and SIGQUIT are ignored: none of them ends the
+# wrapper and orphans the command. SIGSTOP cannot be trapped.
 #
 # launchd's SIGKILL, ExitTimeOut seconds after its SIGTERM, also lands on the
 # wrapper alone and cannot be trapped: a command that ignores SIGTERM would
@@ -117,6 +120,19 @@ notify() {
 }
 
 #######################################
+# Sends a signal to the job, if it has been started. Called from the traps.
+# Globals:
+#   pid (main's, empty until the job is forked)
+# Arguments:
+#   The signal name.
+#######################################
+# shellcheck disable=SC2329 # invoked from the traps in main
+forward_signal() {
+  [[ -n "${pid}" ]] && kill -s "$1" "${pid}" 2>/dev/null
+  return 0
+}
+
+#######################################
 # Enforces --kill-after on a job that has been sent SIGTERM: returns once the
 # job has exited, or sends it SIGKILL when the deadline passes first. The
 # deadline is read off SECONDS, bash's clock, not counted in polls, so it
@@ -166,11 +182,11 @@ kill_at_deadline() {
 #######################################
 main() {
   local alert_after=2 kill_after=''
-  local state fails_file prev fails started pid stopped='' code elapsed sig
-  local killed=''
+  local state fails_file prev fails started pid='' stopped='' code elapsed sig
+  local killed='' woke='' deadline_done='' again
 
   LABEL="${1:-}"
-  shift || true
+  shift
   if [[ -z "${LABEL}" ]]; then
     usage_error 'no label given'
   fi
@@ -212,6 +228,23 @@ main() {
     usage_error 'no command given'
   fi
 
+  # The stop traps go in before anything is forked, so that a stop at any
+  # later point is recorded and never takes its default action, which would
+  # kill the wrapper and orphan the job. They hold the signal number for the
+  # exit status of a stop before the job has started, and set woke so that a
+  # wait they interrupt is told from one that ended with the job.
+  trap 'stopped=1; woke=1; forward_signal TERM' HUP
+  trap 'stopped=2; woke=1; forward_signal TERM' INT
+  trap 'stopped=15; woke=1; forward_signal TERM' TERM
+  trap 'woke=1; forward_signal USR1' USR1
+  trap 'woke=1; forward_signal USR2' USR2
+  trap 'woke=1; forward_signal ALRM' ALRM
+  # A handler, not an ignore, until the job is forked: an ignored signal is
+  # inherited, and the job must keep SIGPIPE's default.
+  trap ':' PIPE
+  # The job starts with SIGQUIT ignored in any case (see below).
+  trap '' QUIT
+
   state="${HOME}/.local/state/launchd-run/${LABEL}"
   AUDIT="${HOME}/Library/Logs/launchd-run.log"
   readonly AUDIT
@@ -226,6 +259,10 @@ main() {
   note "started: launchd-run $(repo_version)"
 
   started="$(date +%s)"
+  if [[ -n "${stopped}" ]]; then
+    note "stopped by signal before the job started - not counted"
+    exit $((128 + stopped))
+  fi
   # The job runs in the background so that a stop signal reaches the wrapper's
   # trap instead of killing it outright. <&0 keeps stdin attached, which bash
   # would otherwise replace with /dev/null for a background job. One side
@@ -235,32 +272,50 @@ main() {
   # alone and cannot be trapped, which is what --kill-after is for.
   "$@" <&0 &
   pid=$!
-  trap 'stopped=1; kill -TERM "${pid}" 2>/dev/null' HUP INT TERM
-  # The braces keep bash's own "Segmentation fault ..." report of a crashed
-  # job off the job's stderr.
-  { wait "${pid}"; } 2>/dev/null
-  code=$?
+  trap '' PIPE
+  # A stop that came after the check above but before the pid was known was
+  # recorded and could not be forwarded. Send it now, and again a few times:
+  # a job that has not yet exec'd can still be running the wrapper's own
+  # handler, which would swallow the signal.
   if [[ -n "${stopped}" ]]; then
-    # The trap interrupted wait with 128+signal before the job had exited.
-    # Wait for the job itself and take its status whatever it is: a job that
-    # handles SIGTERM and exits 0 has stopped cleanly.
-    #
-    # With --kill-after, a job that ignores the forwarded SIGTERM is not
-    # waited for indefinitely: it is killed at the deadline, so that the wait
-    # reaps it and the stop is logged before launchd's SIGKILL is due. The
-    # kill and the wait share one redirect, so bash's "Killed" report of the
-    # job cannot reach the job's stderr between the two.
-    {
-      if [[ -n "${kill_after}" ]] \
-        && kill_at_deadline "${pid}" "${kill_after}"; then
-        killed=1
-      fi
-      wait "${pid}"
-    } 2>/dev/null
-    code=$?
+    for _ in 1 2 3; do
+      kill -TERM "${pid}" 2>/dev/null || break
+      /bin/sleep 0.1
+    done 2>/dev/null
   fi
+  # A trapped signal interrupts wait with 128+signal while the job is still
+  # running, so the job is waited for again until it has gone, and the wait
+  # that reaps it has the last word on its status. With --kill-after a job
+  # that ignores the forwarded SIGTERM is killed at the deadline instead of
+  # being waited for indefinitely, so that the stop is logged before launchd's
+  # SIGKILL is due. The braces keep bash's own "Segmentation fault ..." and
+  # "Killed" reports of the job off the job's stderr.
+  {
+    while :; do
+      if [[ -n "${stopped}" && -n "${kill_after}" && -z "${deadline_done}" ]] \
+        && kill -0 "${pid}"; then
+        deadline_done=1
+        if kill_at_deadline "${pid}" "${kill_after}"; then
+          killed=1
+        fi
+      fi
+      woke=''
+      wait "${pid}"
+      code=$?
+      [[ -n "${woke}" ]] || break
+      kill -0 "${pid}" && continue
+      # A signal came in and the job is gone: the wait returned either its
+      # status or 128+signal with the job not yet reaped. A second wait
+      # returns the status in the second case, and "not a child" (127) or the
+      # same status in the first.
+      wait "${pid}"
+      again=$?
+      ((again == 127)) || code="${again}"
+      break
+    done
+  } 2>/dev/null
   # The job is done; a further stop must not cut the bookkeeping short.
-  trap '' HUP INT TERM
+  trap '' HUP INT TERM USR1 USR2 ALRM
   elapsed=$(($(date +%s) - started))
 
   # Anything but a plain decimal (so no leading zero, which $(( )) would read
