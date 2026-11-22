@@ -1161,9 +1161,10 @@ lr_stop_gate() {
 #######################################
 # Starts the wrapper in the background the way launchd does: with SIGINT and
 # SIGQUIT at their defaults (a shell starts its background jobs with both
-# ignored), through a perl launcher that writes the wrapper's pid to
-# $CASE_DIR/wrapper.pid and, once it ends, the signal that killed it (0 for
-# none) to $CASE_DIR/killed-by.
+# ignored) and SIGPIPE too (a CI runner can start the suite with it ignored,
+# which no shell can undo). It goes through a perl launcher that writes the
+# wrapper's pid to $CASE_DIR/wrapper.pid and, once it ends, the signal that
+# killed it (0 for none) to $CASE_DIR/killed-by.
 # Globals:
 #   LR_LAUNCHER (set to the launcher's pid)
 #   LR_WPID (set to the wrapper's pid, or empty if it never started)
@@ -1179,7 +1180,7 @@ lr_stop_start() {
     OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
     REPO_VERSION="${TEST_VERSION}" LR_G_DIR="${CASE_DIR}" \
     LR_G_CMD="${LR_GATE_CMD}" LR_G_ARG="${LR_GATE_ARG}" \
-    /usr/bin/perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT";
+    /usr/bin/perl -e '$SIG{INT} = $SIG{QUIT} = $SIG{PIPE} = "DEFAULT";
       my ($pf, $kf) = splice(@ARGV, 0, 2);
       my $p = fork();
       defined($p) or die;
@@ -1371,8 +1372,11 @@ while :; do /bin/sleep 0.1; done"
 
   # The wrapper may ignore PIPE, but the job must not inherit that: a job
   # that writes to a closed pipe dies of it, as it would without the wrapper.
+  # Through the launcher, so that the wrapper itself starts with SIGPIPE at
+  # its default whatever the suite inherited.
   new_case
-  run_wrap job -- /bin/sh -c 'kill -PIPE $$; exit 0'
+  lr_stop_start job -- /bin/sh -c 'kill -PIPE $$; exit 0'
+  lr_stop_finish 20
   check 'lr-stop-guard: #37 the job starts with SIGPIPE at its default' \
     rc_is 141
 
