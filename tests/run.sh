@@ -782,12 +782,14 @@ test_unexplained_signal_deaths() {
 #   CHILD (set to the job's pid, or empty if the job never started)
 #   WRAPPER_KILLED (set to 1 if the stand-in had to SIGKILL the wrapper)
 #   STOP_SECONDS (set to the whole seconds from SIGTERM to the wrapper's end)
+#   STOP_MS (set to the same span in milliseconds, never understated)
 # Arguments:
 #   The stand-in's ExitTimeOut in seconds, the body of the job script (sh; it
 #   must write its pid to $1 once it is ready), then any wrapper options.
 #######################################
 launchd_stop() {
   local exit_timeout="$1" body="$2" job pidfile wpid t0
+  local t0_ms
   shift 2
   job="${CASE_DIR}/job.sh"
   pidfile="${CASE_DIR}/child.pid"
@@ -815,6 +817,9 @@ launchd_stop() {
   # wait. A stop that lands before then is issue #27, not what is tested here.
   sleep 1
 
+  # Read before the SIGTERM is sent, so STOP_MS can only overstate how long
+  # the wrapper took: a lower bound checked against it never fails falsely.
+  t0_ms="$(now_ms)"
   t0="${SECONDS}"
   kill -TERM "${wpid}"
   # The braces keep bash's "Killed" report of the wrapper out of the output.
@@ -831,8 +836,15 @@ launchd_stop() {
     RC=$?
   } 2>/dev/null
   STOP_SECONDS=$((SECONDS - t0))
+  STOP_MS=$(($(now_ms) - t0_ms))
 }
 
+# The clock in milliseconds (bash 3.2 has no EPOCHREALTIME, BSD date no %N).
+now_ms() {
+  /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'
+}
+
+stop_took_ms_at_least() { [ "${STOP_MS}" -ge "$1" ]; }
 wrapper_killed() { [ "${WRAPPER_KILLED}" -eq 1 ]; }
 wrapper_not_killed() { [ "${WRAPPER_KILLED}" -eq 0 ]; }
 stop_took_at_least() { [ "${STOP_SECONDS}" -ge "$1" ]; }
@@ -885,6 +897,24 @@ test_kill_after_arguments() {
     check "--kill-after '${value}': no state written" state_dir_absent
   done
 
+  # More than 9 digits is refused. A deadline that large is never reached,
+  # and one big enough to wrap bash's arithmetic round to the past would
+  # kill the job the moment it is stopped.
+  for value in 1000000000 99999999999999999999; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    run_wrap job --kill-after "${value}" -- /usr/bin/touch "${marker}"
+    check "--kill-after ${value}: rejected with exit 64" rc_is 64
+    check "--kill-after ${value}: says the limit" \
+      err_has "--kill-after takes at most 9 digits, got '${value}'"
+    check "--kill-after ${value}: command not run" path_absent "${marker}"
+    check "--kill-after ${value}: no state written" state_dir_absent
+  done
+
+  new_case
+  run_wrap job --kill-after 999999999 -- /usr/bin/true
+  check '--kill-after 999999999, the most allowed: exit 0' rc_is 0
+
   new_case
   marker="${CASE_DIR}/ran"
   run_wrap job --kill-after 5 -- /usr/bin/touch "${marker}"
@@ -925,6 +955,8 @@ test_kill_deadline() {
       wrapper_not_killed
     check '#24 deadline: job gone, not orphaned' pid_gone "${CHILD}"
     check '#24 deadline: job had its 2 s first' stop_took_at_least 2
+    check '#24 deadline: and not a moment less than 2 s' \
+      stop_took_ms_at_least 2000
     check '#24 deadline: exit 137 passed through' rc_is 137
     check '#24 deadline: outcome line names the SIGKILL' \
       audit_has 'stopped by signal, SIGKILL after 2s (exit 137, '
