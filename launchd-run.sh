@@ -2,7 +2,7 @@
 #
 # Wrap a launchd job so its failures are visible.
 #
-#   launchd-run.sh LABEL [--after N] -- command [args...]
+#   launchd-run.sh LABEL [--after N] [--kill-after SECONDS] -- command [args...]
 #
 # Runs the command, passes its stdout/stderr and exit code straight through, and
 # raises a Notification Center banner once it has failed N consecutive times
@@ -12,6 +12,12 @@
 # kill, bootout, logout, a KeepAlive restart) signals the wrapper, not the
 # command. SIGHUP, SIGINT and SIGTERM are therefore forwarded to the command
 # as SIGTERM, and the stop is logged once the command has exited.
+#
+# launchd's SIGKILL, ExitTimeOut seconds after its SIGTERM, also lands on the
+# wrapper alone and cannot be trapped: a command that ignores SIGTERM would
+# outlive the wrapper as an orphan with no outcome logged. With --kill-after
+# the wrapper sends the command SIGKILL itself that many seconds after
+# forwarding SIGTERM. Set it a few seconds below the plist's ExitTimeOut.
 #
 # Why a wrapper and not a line in each script: the jobs it guards are written in
 # different languages and live in different places (a git clone, a cloud mount,
@@ -47,7 +53,8 @@ AUDIT=''
 #######################################
 usage_error() {
   echo "launchd-run: $*" >&2
-  echo 'usage: launchd-run.sh LABEL [--after N] -- cmd...' >&2
+  echo 'usage: launchd-run.sh LABEL [--after N] [--kill-after SECONDS]' \
+    '-- cmd...' >&2
   exit "${EX_USAGE}"
 }
 
@@ -110,19 +117,51 @@ notify() {
 }
 
 #######################################
+# Enforces --kill-after on a job that has been sent SIGTERM: returns once the
+# job has exited, or sends it SIGKILL when the deadline passes first. The
+# deadline is read off SECONDS, bash's clock, not counted in polls, so it
+# holds on a loaded machine. SECONDS ticks in whole seconds, so one tick more
+# than asked is waited for: the job gets its full time and up to a second
+# over, never less. The caller reaps the job, under the same stderr redirect
+# as this call: bash reports a job killed by a signal on stderr at whichever
+# command it runs next after the job has died.
+# Arguments:
+#   The job's pid, then the deadline in whole seconds (at most 9 digits, so
+#   the sum below cannot wrap).
+# Returns:
+#   0 if the job was sent SIGKILL, 1 if it exited in time.
+#######################################
+kill_at_deadline() {
+  local job="$1"
+  local deadline=$((SECONDS + $2 + 1))
+  while kill -0 "${job}"; do
+    if ((SECONDS >= deadline)); then
+      # From here no stop may interrupt the reap: a stop that lands just
+      # after a job dies of a signal has hung bash 3.2 (issue #52).
+      trap '' HUP INT TERM
+      kill -KILL "${job}" || return 1
+      return 0
+    fi
+    /bin/sleep 0.1
+  done
+  return 1
+} 2>/dev/null
+
+#######################################
 # Parses the command line, runs the job and updates its failure streak.
 # Globals:
 #   LABEL, AUDIT (set here, then read-only)
 # Arguments:
-#   LABEL [--after N] -- command [args...]
+#   LABEL [--after N] [--kill-after SECONDS] -- command [args...]
 # Outputs:
 #   The job's own stdout and stderr; usage errors on stderr.
 # Returns:
 #   Exits with the job's status, or EX_USAGE on a malformed command line.
 #######################################
 main() {
-  local alert_after=2
+  local alert_after=2 kill_after=''
   local state fails_file prev fails started pid stopped='' code elapsed sig
+  local killed=''
 
   LABEL="${1:-}"
   shift || true
@@ -137,6 +176,20 @@ main() {
         alert_after="${2:-}"
         if [[ ! "${alert_after}" =~ ^[1-9][0-9]*$ ]]; then
           usage_error "--after needs a positive integer, got '${alert_after}'"
+        fi
+        shift 2
+        ;;
+      --kill-after)
+        kill_after="${2:-}"
+        if [[ ! "${kill_after}" =~ ^[1-9][0-9]*$ ]]; then
+          usage_error \
+            "--kill-after needs a positive integer, got '${kill_after}'"
+        fi
+        # Longer than this and the deadline sum could wrap round to the
+        # past, which would kill the job the moment it is stopped.
+        if ((${#kill_after} > 9)); then
+          usage_error \
+            "--kill-after takes at most 9 digits, got '${kill_after}'"
         fi
         shift 2
         ;;
@@ -171,7 +224,9 @@ main() {
   # trap instead of killing it outright. <&0 keeps stdin attached, which bash
   # would otherwise replace with /dev/null for a background job. One side
   # effect stays: bash starts a background job with SIGINT and SIGQUIT
-  # ignored, and the job inherits that; launchd only ever sends SIGTERM.
+  # ignored, and the job inherits that. launchd stops a job with SIGTERM and
+  # then, once ExitTimeOut has passed, SIGKILL; the SIGKILL hits the wrapper
+  # alone and cannot be trapped, which is what --kill-after is for.
   "$@" <&0 &
   pid=$!
   trap 'stopped=1; kill -TERM "${pid}" 2>/dev/null' HUP INT TERM
@@ -183,7 +238,19 @@ main() {
     # The trap interrupted wait with 128+signal before the job had exited.
     # Wait for the job itself and take its status whatever it is: a job that
     # handles SIGTERM and exits 0 has stopped cleanly.
-    { wait "${pid}"; } 2>/dev/null
+    #
+    # With --kill-after, a job that ignores the forwarded SIGTERM is not
+    # waited for indefinitely: it is killed at the deadline, so that the wait
+    # reaps it and the stop is logged before launchd's SIGKILL is due. The
+    # kill and the wait share one redirect, so bash's "Killed" report of the
+    # job cannot reach the job's stderr between the two.
+    {
+      if [[ -n "${kill_after}" ]] \
+        && kill_at_deadline "${pid}" "${kill_after}"; then
+        killed=1
+      fi
+      wait "${pid}"
+    } 2>/dev/null
     code=$?
   fi
   # The job is done; a further stop must not cut the bookkeeping short.
@@ -206,7 +273,12 @@ main() {
   # (jetsam, the job's own timeout -s KILL, a manual kill -9) are failures
   # and are counted below.
   if [[ -n "${stopped}" ]]; then
-    note "stopped by signal (exit ${code}, ${elapsed}s) - not counted"
+    if [[ -n "${killed}" ]]; then
+      note "stopped by signal, SIGKILL after ${kill_after}s" \
+        "(exit ${code}, ${elapsed}s) - not counted"
+    else
+      note "stopped by signal (exit ${code}, ${elapsed}s) - not counted"
+    fi
     exit "${code}"
   fi
 
