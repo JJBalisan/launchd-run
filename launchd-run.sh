@@ -34,8 +34,13 @@ set -uo pipefail
 # the job with the wrapper's value, so the caller's values of them are taken
 # here, before the first assignment, and put back by exec_job. Only names the
 # caller set are put back: an unset one stays unset. Keep the list in step
-# with every global and every local of main (tests/lr_env_s3_names.sh checks).
-launchd_run_job_env=(/usr/bin/env --)
+# with every global and every local of main (tests/lr_env_s3_boundary.sh
+# checks). The two names used to do this are put back too, read before they
+# are first assigned.
+# shellcheck disable=SC2128  # Read as the caller's scalar, before the array.
+launchd_run_job_env=(/usr/bin/env --
+  ${launchd_run_job_env+"launchd_run_job_env=${launchd_run_job_env}"}
+  ${launchd_run_name+"launchd_run_name=${launchd_run_name}"})
 for launchd_run_name in REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES \
   AUDIT_KEEP_LINES alert_after kill_after state fails_file prev fails started \
   pid stopped code elapsed sig killed woke deadline_done; do
