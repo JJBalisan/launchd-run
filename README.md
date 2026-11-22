@@ -11,15 +11,15 @@ launchd-run.sh LABEL [--after N] [--kill-after SECONDS] -- command [args...]
 Runs the command, passes stdout, stderr and the exit code straight through, and
 raises a Notification Center banner once the job has failed `N` consecutive
 times (default 2), re-raising every run it stays broken and once more when it
-recovers. `N` must be a positive integer of at most 9 digits, and the label must not
-contain `/` or start with `.`; anything else is a usage error (exit 64) and
-the command is not run. Central audit trail in
+recovers. `N` must be a positive integer of at most 9 digits, and the label
+must not contain `/` or start with `.`; anything else is a usage error
+(exit 64) and the command is not run. Central audit trail in
 `~/Library/Logs/launchd-run.log`: every run writes a start line,
 `started: launchd-run <version>`, naming the wrapper's own checkout (see
 "Releasing"), then an outcome line; per-job counters in
 `~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
-plain decimal number of at most 9 digits reads as 0, so a corrupt one restarts the streak rather
-than breaking the wrapper. A counter that cannot be written at all (say, a
+plain decimal number of at most 9 digits reads as 0, so a corrupt one restarts
+the streak rather than breaking the wrapper. A counter that cannot be written at all (say, a
 root-owned `~/.local/state`) raises a banner on every failure instead, and one
 that cannot be removed gets `0` written over it, which ends the streak and
 raises the "Back to normal" banner as usual (the audit line still says
