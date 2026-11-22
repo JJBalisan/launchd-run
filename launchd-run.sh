@@ -183,7 +183,7 @@ kill_at_deadline() {
 main() {
   local alert_after=2 kill_after=''
   local state fails_file prev fails started pid='' stopped='' code elapsed sig
-  local killed='' woke='' deadline_done='' again
+  local killed='' woke='' deadline_done=''
 
   LABEL="${1:-}"
   shift
@@ -305,12 +305,11 @@ main() {
       [[ -n "${woke}" ]] || break
       kill -0 "${pid}" && continue
       # A signal came in and the job is gone: the wait returned either its
-      # status or 128+signal with the job not yet reaped. A second wait
-      # returns the status in the second case, and "not a child" (127) or the
-      # same status in the first.
+      # status or 128+signal with the job reaped in the background meanwhile.
+      # bash keeps a reaped job's status, so a second wait returns it in both
+      # cases, a status of 127 included.
       wait "${pid}"
-      again=$?
-      ((again == 127)) || code="${again}"
+      code=$?
       break
     done
   } 2>/dev/null
