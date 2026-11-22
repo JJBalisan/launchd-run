@@ -19,8 +19,9 @@ must not contain `/` or start with `.`; anything else is a usage error
 "Releasing"), then an outcome line; per-job counters in
 `~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
 plain decimal number of at most 9 digits reads as 0, so a corrupt one restarts
-the streak rather than breaking the wrapper. A counter that cannot be written at all (say, a
-root-owned `~/.local/state`) raises a banner on every failure instead, and one
+the streak rather than breaking the wrapper. A counter that cannot be written
+at all (say, a root-owned `~/.local/state`) raises a banner on every failure
+instead, and one
 that cannot be removed gets `0` written over it, which ends the streak and
 raises the "Back to normal" banner as usual (the audit line still says
 "cannot clear" and adds that the count was reset); if that write fails too,
