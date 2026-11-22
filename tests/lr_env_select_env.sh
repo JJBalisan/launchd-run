@@ -34,8 +34,37 @@ readonly SEL_NAMES='REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES
 # A perl program that exits 9 if it started with SIGPIPE ignored.
 # shellcheck disable=SC2016  # $SIG belongs to perl.
 readonly SEL_PIPE='exit(($SIG{PIPE} || "") eq "IGNORE" ? 9 : 0)'
+# A perl program that puts SIGPIPE back to its default and runs its arguments.
+# shellcheck disable=SC2016  # $SIG and @ARGV belong to perl.
+readonly SEL_RESET='$SIG{PIPE} = "DEFAULT"; exec { $ARGV[0] } @ARGV; exit 127'
 
 SEL_CMD=()
+
+#######################################
+# Like lr_env_wrap with no extra variables, but the wrapper starts with
+# SIGPIPE at its default whatever the suite inherited: a CI runner can start
+# the suite with SIGPIPE ignored, which no shell can undo.
+# Globals:
+#   RC (set to the wrapper's exit status)
+# Arguments:
+#   HOME: "case", "unset" or "empty"; then arguments for launchd-run.sh.
+#######################################
+sel_wrap_pipe_default() {
+  local home="$1"
+  local cmd=(/usr/bin/env)
+  shift
+  case "${home}" in
+    unset) cmd+=(-u HOME) ;;
+    empty) cmd+=(HOME=) ;;
+    *) cmd+=("HOME=${CASE_HOME}") ;;
+  esac
+  cmd+=("PATH=${STUB_BIN}:${SYS_PATH}")
+  cmd+=("OSASCRIPT_CALLS=${CASE_DIR}/osascript.calls")
+  cmd+=("REPO_VERSION=${TEST_VERSION}")
+  /usr/bin/perl -e "${SEL_RESET}" "${cmd[@]}" "${WRAPPER}" "$@" \
+    >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
+  RC=$?
+}
 
 #######################################
 # Sets SEL_CMD to an env -i command line holding only the harness's own
@@ -176,13 +205,13 @@ test_sel_no_home() {
     check "select: HOME ${home}: stdin reaches the job" out_is in-line
 
     new_case
-    lr_env_wrap "${home}" :: job -- /usr/bin/perl \
+    sel_wrap_pipe_default "${home}" job -- /usr/bin/perl \
       -e "${SEL_PIPE}"
     check "select: HOME ${home}: the job starts with SIGPIPE's default" \
       rc_is 0
   done
   new_case
-  lr_env_wrap case :: job -- /usr/bin/perl \
+  sel_wrap_pipe_default case job -- /usr/bin/perl \
     -e "${SEL_PIPE}"
   check 'select: HOME set: the job starts with SIGPIPE'"'"'s default' rc_is 0
 }
