@@ -1804,6 +1804,237 @@ test_lr_env_30() {
   done
 }
 
+# --- lr-count: issues #45, #46, #48. -----------------------------------------
+
+# No audit log was written.
+lr_count_no_audit() { [ ! -e "${CASE_HOME}/Library/Logs/launchd-run.log" ]; }
+
+# One line of the wrapper's stderr contains both fixed strings.
+lr_count_err_line_has() {
+  local line
+  while IFS= read -r line; do
+    case "${line}" in
+      *"$1"*) ;;
+      *) continue ;;
+    esac
+    case "${line}" in
+      *"$2"*) return 0 ;;
+    esac
+  done <"${CASE_DIR}/err"
+  return 1
+}
+
+# Exactly N osascript calls contain the fixed string.
+lr_count_calls_with() {
+  local n
+  n="$(grep -F -c -- "$1" "${CASE_DIR}/osascript.calls" 2>/dev/null)"
+  [ "${n:-0}" -eq "$2" ]
+}
+
+# The audit line that says the counter cannot be cleared also says the count
+# was reset to 0 (matched loosely: "reset", then a 0 with no digits between).
+lr_count_reset_noted() {
+  local lines
+  lines="$(grep -F -- 's) - cannot clear' \
+    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null)"
+  [ -n "${lines}" ] || return 1
+  grep -E -i -q 'reset[^0-9]*0([^0-9]|$)' <<<"${lines}"
+}
+
+lr_count_no_reset() { ! lr_count_reset_noted; }
+
+# The README, its lines joined, no longer says that a counter which cannot be
+# cleared raises no "Back to normal" banner.
+lr_count_readme_lacks_stale() {
+  local text
+  text="$(tr '\n' ' ' <"${REPO}/README.md" | tr -s ' ')"
+  case "${text}" in
+    *'cannot be cleared raises no "Back to normal" banner'*) return 1 ;;
+  esac
+  return 0
+}
+
+# Issue #45: --after and a stored fail count are capped at 9 digits, so no
+# value the wrapper accepts can wrap its arithmetic.
+test_lr_count_45() {
+  local marker value tag
+  echo '# lr-count #45: --after takes at most 9 digits'
+  for value in 1000000000 18446744073709551615 99999999999999999999; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    run_wrap job --after "${value}" -- /usr/bin/touch "${marker}"
+    check "lr-count: #45 --after ${value}: rejected with exit 64" rc_is 64
+    check "lr-count: #45 --after ${value}: the message names it" \
+      lr_count_err_line_has '--after' "${value}"
+    check "lr-count: #45 --after ${value}: command not run" \
+      path_absent "${marker}"
+    check "lr-count: #45 --after ${value}: no state written" state_dir_absent
+  done
+
+  new_case
+  run_wrap job --after 18446744073709551615 -- /usr/bin/true
+  check 'lr-count: #45 --after 2^64-1 on a clean success: no banner' \
+    calls_are 0
+
+  new_case
+  run_wrap job --after 999999999 -- /usr/bin/true
+  check 'lr-count-guard: #45 --after 999999999, the most allowed: exit 0' \
+    rc_is 0
+
+  new_case
+  seed_counter job 999999998
+  run_wrap job --after 999999999 -- /bin/sh -c 'exit 3'
+  check 'lr-count-guard: #45 9-digit count, fail: counter 999999999' \
+    counter_is job 999999999
+  check 'lr-count-guard: #45 9-digit count, fail: banner at --after' \
+    calls_are 1
+
+  echo '# lr-count #45: a stored count of more than 9 digits restarts'
+  for value in 1000000000 1234567890 9223372036854775807 \
+    18446744073709551615 99999999999999999999; do
+    new_case
+    seed_counter job "${value}"
+    run_wrap job -- /bin/sh -c 'exit 3'
+    check "lr-count: #45 counter ${value}, fail: counter restarts at 1" \
+      counter_is job 1
+    check "lr-count: #45 counter ${value}, fail: audit shows consecutive: 1" \
+      audit_has 'consecutive: 1)'
+    check "lr-count-guard: #45 counter ${value}, fail: exit 3 passed" rc_is 3
+
+    new_case
+    seed_counter job "${value}"
+    run_wrap job -- /usr/bin/true
+    tag='lr-count:'
+    case "${value}" in
+      # Reads as -1 at the base, so this one passes there too.
+      18446744073709551615) tag='lr-count-guard:' ;;
+    esac
+    check "${tag} #45 counter ${value}, ok: no banner" calls_are 0
+    check "lr-count-guard: #45 counter ${value}, ok: counter removed" \
+      counter_absent job
+    check "lr-count-guard: #45 counter ${value}, ok: no error noise" err_empty
+  done
+}
+
+# Issue #46: the label is a path component, so one with a / or a leading .
+# is refused before anything is written or run.
+test_lr_count_46() {
+  local label marker
+  echo '# lr-count #46: a label with a / or a leading . is a usage error'
+  for label in ../../../x a/job ./a/job /abs a/ .job . ..; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    run_wrap "${label}" -- /usr/bin/touch "${marker}"
+    check "lr-count: #46 label '${label}': exit 64" rc_is 64
+    check "lr-count: #46 label '${label}': usage on stderr" \
+      err_has 'usage: launchd-run.sh LABEL'
+    check "lr-count: #46 label '${label}': command not run" \
+      path_absent "${marker}"
+    check "lr-count: #46 label '${label}': no state written" state_dir_absent
+    check "lr-count: #46 label '${label}': no audit line" lr_count_no_audit
+  done
+
+  new_case
+  run_wrap ../../../x -- /bin/sh -c 'exit 3'
+  check 'lr-count: #46 label ../../../x, fail: nothing written above HOME' \
+    path_absent "${CASE_HOME}/x"
+
+  # Rejected as a usage error, so even when there is no HOME to write to.
+  new_case
+  marker="${CASE_DIR}/ran"
+  lr_env_wrap unset :: a/job -- /usr/bin/touch "${marker}"
+  check "lr-count: #46 HOME unset, label 'a/job': exit 64" rc_is 64
+  check "lr-count: #46 HOME unset, label 'a/job': command not run" \
+    path_absent "${marker}"
+
+  for label in com.example.job a..b job.; do
+    new_case
+    run_wrap "${label}" -- /bin/sh -c 'exit 3'
+    check "lr-count-guard: #46 label '${label}': accepted, exit 3" rc_is 3
+    check "lr-count-guard: #46 label '${label}': counted" \
+      counter_is "${label}" 1
+  done
+}
+
+# Issue #48: on a success whose counter cannot be removed, the wrapper writes
+# 0 to it. If that works the streak is cleared and the recovery reported
+# once; if not, nothing changes.
+test_lr_count_48() {
+  local dir
+  echo '# lr-count #48: an unremovable fail count is reset to 0'
+  new_case
+  seed_counter job 5
+  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  chmod a-w "${dir}"
+  if : 2>/dev/null >"${dir}/probe"; then
+    printf 'skip        %s\n' 'lr-count: #48 directory is still writable'
+  else
+    run_wrap job -- /usr/bin/true
+    check 'lr-count-guard: #48 reset: exit 0' rc_is 0
+    check 'lr-count: #48 reset: counter holds 0' counter_is job 0
+    check 'lr-count: #48 reset: one recovery banner' calls_are 1
+    check 'lr-count: #48 reset: banner reports the old streak' \
+      call_has 1 \
+      '| succeeded after 5 failed runs | launchd: job | Back to normal'
+    check 'lr-count-guard: #48 reset: audit still says cannot clear' \
+      audit_has 's) - cannot clear'
+    check 'lr-count: #48 reset: that line says the count was reset to 0' \
+      lr_count_reset_noted
+    check 'lr-count-guard: #48 reset: no error on the job stderr' err_empty
+
+    run_wrap job -- /bin/sh -c 'exit 3'
+    check 'lr-count: #48 reset, then fail: counter 1' counter_is job 1
+    check 'lr-count: #48 reset, then fail: audit shows consecutive: 1' \
+      audit_has 'consecutive: 1)'
+    check 'lr-count: #48 reset, then fail: no failing banner' \
+      lr_count_calls_with 'Job failing' 0
+
+    run_wrap job -- /usr/bin/true
+    check 'lr-count: #48 reset, fail, ok: recovery reported once in all' \
+      lr_count_calls_with 'Back to normal' 1
+    check 'lr-count: #48 reset, fail, ok: counter 0 again' counter_is job 0
+  fi
+  chmod u+w "${dir}"
+
+  new_case
+  seed_counter job 1
+  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  chmod a-w "${dir}"
+  if : 2>/dev/null >"${dir}/probe"; then
+    printf 'skip        %s\n' 'lr-count: #48 directory is still writable'
+  else
+    run_wrap job -- /usr/bin/true
+    check 'lr-count: #48 reset below --after: counter holds 0' \
+      counter_is job 0
+    check 'lr-count-guard: #48 reset below --after: no banner' calls_are 0
+  fi
+  chmod u+w "${dir}"
+
+  echo '# lr-count #48: a counter that can be neither removed nor written'
+  new_case
+  seed_counter job 5
+  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  chmod a-w "${dir}/fail-count" "${dir}"
+  if : 2>/dev/null >>"${dir}/fail-count"; then
+    printf 'skip        %s\n' 'lr-count: #48 counter is still writable'
+  else
+    run_wrap job -- /usr/bin/true
+    check 'lr-count-guard: #48 neither: exit 0' rc_is 0
+    check 'lr-count-guard: #48 neither: no banner' calls_are 0
+    check 'lr-count-guard: #48 neither: counter still 5' counter_is job 5
+    check 'lr-count-guard: #48 neither: audit says cannot clear' \
+      audit_has 's) - cannot clear'
+    check 'lr-count-guard: #48 neither: no reset in the audit' \
+      lr_count_no_reset
+    check 'lr-count-guard: #48 neither: no error on the job stderr' err_empty
+  fi
+  chmod u+w "${dir}" "${dir}/fail-count"
+
+  new_case
+  check 'lr-count: #48 README no longer says an uncleared count stays silent' \
+    lr_count_readme_lacks_stale
+}
+
 main() {
   if [ ! -x "${WRAPPER}" ]; then
     echo "run.sh: wrapper not found or not executable: ${WRAPPER}" >&2
@@ -1838,6 +2069,9 @@ main() {
   test_lr_env_23
   test_lr_env_26
   test_lr_env_30
+  test_lr_count_45
+  test_lr_count_46
+  test_lr_count_48
 
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]
