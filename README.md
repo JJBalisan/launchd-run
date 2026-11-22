@@ -85,11 +85,13 @@ forwards SIGTERM to the command, waits for it to exit and then logs the stop
 provided the command exits on SIGTERM (the next section covers one that does
 not). The wrapper signals the command it started and nothing else. That
 command's own children are left to launchd, which sends SIGTERM to whatever
-remains in the process group once the wrapper has exited (seen on macOS
-27.0.1, [#24](https://github.com/JJBalisan/launchd-run/issues/24)). That sweep
-does not happen when the plist sets `AbandonProcessGroup` or when the wrapper
-is run by hand, and a child that ignores SIGTERM survives it. A command that
-handles SIGTERM is logged as stopped
+remains in the process group once the wrapper has exited (`man launchd.plist`,
+under `AbandonProcessGroup`; on macOS 27.0.1 it was seen after launchd killed
+the wrapper, [#24](https://github.com/JJBalisan/launchd-run/issues/24)). That
+sweep does not happen when the plist sets `AbandonProcessGroup` or when the
+wrapper is run by hand, and a child that ignores SIGTERM survives it.
+`--kill-after` bounds the wait when the command itself is slow to exit. A
+command that handles SIGTERM is logged as stopped
 whatever code it exits with, 0 or 1 included. Further SIGHUP, SIGINT or
 SIGTERM during the shutdown are forwarded as SIGTERM again; the wrapper logs
 and exits only once the command has exited, with the command's own status.
