@@ -228,6 +228,12 @@ main() {
   if [[ -z "${LABEL}" ]]; then
     usage_error 'no label given'
   fi
+  # The label names the state directory, so it must be one path component that
+  # is not hidden: a "/" would reach outside the state tree, and a leading "."
+  # makes "." and ".." (the state tree itself, or its parent).
+  if [[ "${LABEL}" == */* || "${LABEL}" == .* ]]; then
+    usage_error "label must not contain '/' or start with '.', got '${LABEL}'"
+  fi
   readonly LABEL
 
   while (($# > 0)); do
@@ -236,6 +242,10 @@ main() {
         alert_after="${2:-}"
         if [[ ! "${alert_after}" =~ ^[1-9][0-9]*$ ]]; then
           usage_error "--after needs a positive integer, got '${alert_after}'"
+        fi
+        # Longer than this and the counter arithmetic could wrap round.
+        if ((${#alert_after} > 9)); then
+          usage_error "--after takes at most 9 digits, got '${alert_after}'"
         fi
         shift 2
         ;;
@@ -365,10 +375,11 @@ main() {
   elapsed=$(($(date +%s) - started))
 
   # Anything but a plain decimal (so no leading zero, which $(( )) would read
-  # as octal) means the counter is missing or corrupt: start the streak over.
+  # as octal) of at most 9 digits (so the sum below cannot wrap) means the
+  # counter is missing or corrupt: start the streak over.
   fails_file="${state}/fail-count"
   prev="$(cat "${fails_file}" 2>/dev/null)"
-  if [[ ! "${prev}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  if [[ ! "${prev}" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
     prev=0
   fi
 
@@ -390,16 +401,21 @@ main() {
   fi
 
   if ((code == 0)); then
-    # A counter that cannot be cleared (a state directory left root-owned by
-    # a sudo run) reads back the same streak on every success, so only a
-    # streak that was really cleared is reported as a recovery.
+    # A counter that cannot be removed (a state directory left root-owned by
+    # a sudo run) would read back the same streak on every success, so 0 is
+    # written over it. Only a streak that was really cleared, by either way,
+    # is reported as a recovery; if neither works the streak stands and
+    # nothing is reported.
     if rm -f "${fails_file}" 2>/dev/null; then
       note "ok (${elapsed}s)"
-      if ((prev >= alert_after)); then
-        notify "Back to normal" "succeeded after ${prev} failed runs"
-      fi
+    elif { printf '0' >"${fails_file}"; } 2>/dev/null; then
+      note "ok (${elapsed}s) - cannot clear ${fails_file}, count reset to 0"
     else
       note "ok (${elapsed}s) - cannot clear ${fails_file}"
+      prev=0
+    fi
+    if ((prev >= alert_after)); then
+      notify "Back to normal" "succeeded after ${prev} failed runs"
     fi
   else
     fails=$((prev + 1))
