@@ -1478,6 +1478,326 @@ test_lr_stop_41() {
     lr_stop_source_lacks 'shift || true'
 }
 
+# --- lr-env: the job's environment, HOME and command lookup. -----------------
+
+# Every name the wrapper sets or declares (issue #23).
+readonly LR_ENV_NAMES='REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES
+  AUDIT_KEEP_LINES alert_after kill_after state started stopped pid code
+  killed woke deadline_done fails prev fails_file elapsed sig'
+# Of those, the locals of main first assigned after the job is forked: the
+# job already gets the caller's value of these.
+readonly LR_ENV_LATE=' code fails prev fails_file elapsed sig '
+# Every function the wrapper defines (issue #30).
+readonly LR_ENV_FUNCS='note notify main rotate_audit usage_error repo_version
+  forward_signal kill_at_deadline'
+
+# Read by lr_env_wrap: a directory put first on PATH, if not empty, and the
+# REPO_VERSION to pin, none if empty.
+LR_ENV_PATH=''
+LR_ENV_VERSION="${TEST_VERSION}"
+# Set by lr_env_dump_job.
+LR_ENV_JOB=()
+
+#######################################
+# Runs the wrapper inside the current case, like run_wrap, with a chosen
+# HOME and extra variables in its environment.
+# Globals:
+#   RC (set to the wrapper's exit status)
+#   LR_ENV_PATH, LR_ENV_VERSION (read)
+# Arguments:
+#   HOME: "case" (the case's HOME), "unset" or "empty"; then NAME=value
+#   pairs; then "::"; then arguments for launchd-run.sh.
+#######################################
+lr_env_wrap() {
+  local home="$1"
+  local cmd=(/usr/bin/env)
+  shift
+  case "${home}" in
+    unset) cmd+=(-u HOME) ;;
+    empty) cmd+=(HOME=) ;;
+    *) cmd+=("HOME=${CASE_HOME}") ;;
+  esac
+  cmd+=("PATH=${LR_ENV_PATH:+${LR_ENV_PATH}:}${STUB_BIN}:${SYS_PATH}")
+  cmd+=("OSASCRIPT_CALLS=${CASE_DIR}/osascript.calls")
+  if [ -n "${LR_ENV_VERSION}" ]; then
+    cmd+=("REPO_VERSION=${LR_ENV_VERSION}")
+  fi
+  while [ "$#" -gt 0 ] && [ "$1" != '::' ]; do
+    cmd+=("$1")
+    shift
+  done
+  shift
+  "${cmd[@]}" "${WRAPPER}" "$@" >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
+  RC=$?
+}
+
+#######################################
+# Sets LR_ENV_JOB to the command line of a job that records, for each name
+# given, whether it is in its environment and its value, in
+# $CASE_DIR/env/<name> ("set:<value>" or "unset"), then exits with the given
+# status.
+# Globals:
+#   LR_ENV_JOB (set)
+# Arguments:
+#   The exit status, then the names.
+#######################################
+lr_env_dump_job() {
+  local status="$1"
+  shift
+  mkdir -p "${CASE_DIR}/env"
+  # shellcheck disable=SC2016  # $d, $s and the rest belong to perl.
+  LR_ENV_JOB=(/usr/bin/perl -e
+    'my ($d, $s) = splice(@ARGV, 0, 2);
+    for my $n (@ARGV) {
+      open(my $h, ">", "$d/$n") or die;
+      print $h (exists $ENV{$n} ? "set:$ENV{$n}" : "unset");
+      close($h);
+    }
+    exit $s' "${CASE_DIR}/env" "${status}" "$@")
+}
+
+# The job saw this name with exactly this value ("unset" for none).
+lr_env_job_saw() {
+  local want="$2"
+  [ -f "${CASE_DIR}/env/$1" ] || return 1
+  [ "${want}" = unset ] || want="set:${want}"
+  [ "$(
+    cat "${CASE_DIR}/env/$1"
+    echo x
+  )" = "${want}x" ]
+}
+
+# Lines on the wrapper's stderr.
+lr_env_err_lines_are() {
+  [ "$(wc -l <"${CASE_DIR}/err" | tr -d ' ')" -eq "$1" ]
+}
+
+# The wrapper's stderr holds exactly one line, and it is not bash's own
+# complaint about an unset variable.
+lr_env_one_warning() {
+  lr_env_err_lines_are 1 && ! err_has 'unbound variable'
+}
+
+# The file exists and the wrapper exited with this status.
+lr_env_ran_with() { [ -e "$1" ] && rc_is "$2"; }
+
+# Two start lines, the first not empty, are the same.
+lr_env_same_start() { [ -n "$1" ] && [ "$1" = "$2" ]; }
+
+lr_env_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+
+# The first audit line with its timestamp and label cut off.
+lr_env_start_line() {
+  sed -n '1s/^.*started: /started: /p' \
+    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
+}
+
+# Issue #23: a variable the caller set under a name the wrapper also uses
+# reaches the job with the caller's value, and the wrapper itself still logs
+# to its own audit file under its own label.
+test_lr_env_23() {
+  local name nasty unset_ok start_plain start_root tag
+  echo '# lr-env #23: the caller'"'"'s variables reach the job intact'
+  # shellcheck disable=SC2016  # Meant literally: it must never run.
+  nasty=$'two words\n"dq" \'sq\' \\ * ; | & `x` $(touch pwned) $HOME'
+  for name in ${LR_ENV_NAMES}; do
+    new_case
+    lr_env_dump_job 0 "${name}" LR_ENV_CONTROL
+    (cd "${CASE_DIR}" \
+      && lr_env_wrap case "${name}=${name}:${nasty}" LR_ENV_CONTROL=c :: \
+        job -- "${LR_ENV_JOB[@]}")
+    RC="$?"
+    tag='lr-env:'
+    case "${LR_ENV_LATE}" in
+      *" ${name} "*) tag='lr-env-guard:' ;;
+    esac
+    check "${tag} #23 ${name}: reaches the job with the caller's value" \
+      lr_env_job_saw "${name}" "${name}:${nasty}"
+    check "lr-env-guard: #23 ${name}: control variable intact" \
+      lr_env_job_saw LR_ENV_CONTROL c
+    check "lr-env-guard: #23 ${name}: the job still exits 0" rc_is 0
+    check "lr-env-guard: #23 ${name}: the value was never run" \
+      path_absent "${CASE_DIR}/pwned"
+  done
+
+  for name in LABEL state AUDIT; do
+    new_case
+    lr_env_dump_job 0 "${name}"
+    lr_env_wrap case "${name}=" :: job -- "${LR_ENV_JOB[@]}"
+    check "lr-env: #23 ${name} set empty: reaches the job set and empty" \
+      lr_env_job_saw "${name}" ''
+  done
+
+  echo '# lr-env #23: names the caller did not set stay unset'
+  new_case
+  # shellcheck disable=SC2086  # The list is split on purpose.
+  lr_env_dump_job 0 ${LR_ENV_NAMES}
+  lr_env_wrap case :: job -- "${LR_ENV_JOB[@]}"
+  unset_ok=1
+  for name in ${LR_ENV_NAMES}; do
+    lr_env_job_saw "${name}" unset || unset_ok=''
+  done
+  check 'lr-env-guard: #23 no wrapper name appears in the job unasked' \
+    [ -n "${unset_ok}" ]
+
+  echo '# lr-env #23: the wrapper keeps its own label, log and streak'
+  new_case
+  seed_counter job 1
+  lr_env_wrap case LABEL=other "AUDIT=${CASE_DIR}/other.log" \
+    "state=${CASE_DIR}/other-state" "fails_file=${CASE_DIR}/other-count" \
+    alert_after=99 kill_after=1 stopped=15 pid=notapid code=0 \
+    EX_USAGE=7 AUDIT_MAX_BYTES=1 AUDIT_KEEP_LINES=1 \
+    "LIB=${CASE_DIR}/nolib.sh" prev=50 fails=50 started=0 :: \
+    job -- /bin/sh -c 'exit 3'
+  check 'lr-env-guard: #23 all names set: the job'"'"'s exit 3 passed' rc_is 3
+  check 'lr-env-guard: #23 all names set: logged under the real label' \
+    audit_line_has 2 ' job '
+  check 'lr-env-guard: #23 all names set: failure logged, streak 2' \
+    audit_has 'FAILED exit 3 ('
+  check 'lr-env-guard: #23 all names set: counter now 2' counter_is job 2
+  check 'lr-env-guard: #23 all names set: banner at the default --after 2' \
+    calls_are 1
+  check 'lr-env-guard: #23 all names set: no log at the caller'"'"'s AUDIT' \
+    path_absent "${CASE_DIR}/other.log"
+  check 'lr-env-guard: #23 all names set: no state at the caller'"'"'s path' \
+    path_absent "${CASE_DIR}/other-state"
+  check 'lr-env-guard: #23 all names set: log not trimmed' \
+    audit_lines_are 3
+
+  new_case
+  lr_env_wrap case EX_USAGE=7 :: job --bogus -- /usr/bin/true
+  check 'lr-env-guard: #23 EX_USAGE set: a usage error still exits 64' \
+    rc_is 64
+
+  echo '# lr-env #23: a caller'"'"'s REPO_ROOT does not change the version'
+  LR_ENV_VERSION=''
+  new_case
+  lr_env_wrap case :: job -- /usr/bin/true
+  start_plain="$(lr_env_start_line)"
+  new_case
+  lr_env_wrap case "REPO_ROOT=${CASE_DIR}" :: job -- /usr/bin/true
+  start_root="$(lr_env_start_line)"
+  LR_ENV_VERSION="${TEST_VERSION}"
+  check 'lr-env-guard: #23 REPO_ROOT set: start line names the checkout' \
+    lr_env_same_start "${start_plain}" "${start_root}"
+}
+
+# Issue #26: with HOME unset or empty the wrapper runs the command directly
+# with no bookkeeping and one warning line on stderr, and exits with the
+# command's status. A malformed command line still exits 64 first.
+test_lr_env_26() {
+  local home marker tag quiet
+  for home in unset empty; do
+    echo "# lr-env #26: HOME ${home}"
+    # With HOME empty the job already runs; its bookkeeping is the bug.
+    tag='lr-env:'
+    quiet='lr-env-guard:'
+    if [ "${home}" = empty ]; then
+      tag='lr-env-guard:'
+      quiet='lr-env:'
+    fi
+    new_case
+    marker="${CASE_DIR}/ran"
+    # shellcheck disable=SC2016  # $1 belongs to the job's own sh.
+    lr_env_wrap "${home}" :: job --after 1 -- \
+      /bin/sh -c 'touch "$1"; echo job-out; exit 7' sh "${marker}"
+    check "${tag} #26 HOME ${home}: the job ran" [ -e "${marker}" ]
+    check "${tag} #26 HOME ${home}: exit status is the job's 7" rc_is 7
+    check "${tag} #26 HOME ${home}: job stdout passed through" \
+      out_is job-out
+    check "lr-env: #26 HOME ${home}: one warning line on stderr" \
+      lr_env_one_warning
+    check "${quiet} #26 HOME ${home}: no banner, even at --after 1" \
+      calls_are 0
+
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_wrap "${home}" :: job -- /usr/bin/touch "${marker}"
+    check "${tag} #26 HOME ${home}: a good job runs, exit 0" \
+      lr_env_ran_with "${marker}" 0
+
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_wrap "${home}" :: job --after 3 --kill-after 5 -- \
+      /usr/bin/touch "${marker}"
+    check "${tag} #26 HOME ${home}: options still parsed, the job runs" \
+      [ -e "${marker}" ]
+
+    new_case
+    lr_env_dump_job 0 LABEL
+    lr_env_wrap "${home}" LABEL=mine :: job -- "${LR_ENV_JOB[@]}"
+    check "lr-env: #26 HOME ${home}: the caller's LABEL reaches the job" \
+      lr_env_job_saw LABEL mine
+
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_wrap "${home}" :: job --bogus -- /usr/bin/touch "${marker}"
+    check "lr-env-guard: #26 HOME ${home}: unknown flag still exits 64" \
+      rc_is 64
+    check "lr-env-guard: #26 HOME ${home}: unknown flag: job not run" \
+      path_absent "${marker}"
+    new_case
+    lr_env_wrap "${home}" :: job --after 0 -- /usr/bin/touch "${marker}"
+    check "lr-env-guard: #26 HOME ${home}: --after 0 still exits 64" rc_is 64
+    new_case
+    lr_env_wrap "${home}" :: job
+    check "lr-env-guard: #26 HOME ${home}: no command still exits 64" \
+      rc_is 64
+  done
+
+  echo '# lr-env #26: README'
+  check 'lr-env: #26 README covers a LaunchDaemon' \
+    lr_env_readme_has LaunchDaemon
+  check 'lr-env: #26 README names UserName' lr_env_readme_has UserName
+}
+
+#######################################
+# Writes a program named like one of the wrapper's functions into the
+# case's $CASE_DIR/path, which it puts first on PATH. It writes "ran" to the
+# file given as its first argument and exits with the given status.
+# Globals:
+#   LR_ENV_PATH (set)
+# Arguments:
+#   The name, then the exit status.
+#######################################
+lr_env_path_program() {
+  mkdir -p "${CASE_DIR}/path"
+  # shellcheck disable=SC2016  # $1 belongs to the program.
+  printf '#!/bin/sh\necho ran >"$1"\nexit %s\n' "$2" >"${CASE_DIR}/path/$1"
+  chmod +x "${CASE_DIR}/path/$1"
+  LR_ENV_PATH="${CASE_DIR}/path"
+}
+
+# Issue #30: a command named like one of the wrapper's functions runs the
+# program on PATH, never the function.
+test_lr_env_30() {
+  local name code=10 marker
+  echo '# lr-env #30: commands named like the wrapper'"'"'s functions'
+  for name in ${LR_ENV_FUNCS}; do
+    code=$((code + 1))
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_path_program "${name}" "${code}"
+    lr_env_wrap case :: job -- "${name}" "${marker}"
+    check "lr-env: #30 ${name}: the program on PATH ran" [ -e "${marker}" ]
+    check "lr-env: #30 ${name}: its exit ${code} passed through" \
+      rc_is "${code}"
+    check "lr-env: #30 ${name}: its exit ${code} logged" \
+      audit_has "FAILED exit ${code} ("
+    LR_ENV_PATH=''
+  done
+
+  for name in note main; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_path_program "${name}" 0
+    lr_env_wrap unset :: job -- "${name}" "${marker}"
+    check "lr-env: #30 HOME unset: ${name} runs the program on PATH" \
+      lr_env_ran_with "${marker}" 0
+    LR_ENV_PATH=''
+  done
+}
+
 main() {
   if [ ! -x "${WRAPPER}" ]; then
     echo "run.sh: wrapper not found or not executable: ${WRAPPER}" >&2
@@ -1509,6 +1829,9 @@ main() {
   test_lr_stop_37
   test_lr_stop_25
   test_lr_stop_41
+  test_lr_env_23
+  test_lr_env_26
+  test_lr_env_30
 
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]
