@@ -158,9 +158,10 @@ kill_at_deadline() {
   SECONDS=0
   while kill -0 "${job}"; do
     if ((SECONDS >= deadline)); then
-      # From here no stop may interrupt the reap: a stop that lands just
-      # after a job dies of a signal has hung bash 3.2 (issue #52).
-      trap '' HUP INT TERM
+      # From here no trapped signal may interrupt the reap: one that lands
+      # just after a job dies of a signal has hung bash 3.2 (issue #52). The
+      # job is being killed, so there is nothing left to forward.
+      trap '' HUP INT TERM USR1 USR2 ALRM
       kill -KILL "${job}" || return 1
       return 0
     fi
