@@ -136,7 +136,7 @@ forward_signal() {
 # Records a stop and forwards it to the job as SIGTERM, if the job has been
 # started. Called from the traps.
 # Globals:
-#   stopped, stop_pid, told, wait_on (main's, set); pid (main's, read)
+#   stopped, stop_pid, told, next_wait (main's, set); pid (main's, read)
 # Arguments:
 #   The signal number.
 #######################################
@@ -156,7 +156,7 @@ on_stop() {
   # to wait, after its loop has looked for a stop, would not cut that wait
   # short; pointing it at the wrapper's own pid, which is not a child, makes
   # it return at once, and the loop looks again.
-  wait_on="$$"
+  next_wait="$$"
   if [[ -n "${pid}" ]]; then
     kill -s TERM "${pid}" 2>/dev/null
     told=1
@@ -216,7 +216,7 @@ kill_at_deadline() {
 main() {
   local alert_after=2 kill_after=''
   local state fails_file prev fails started pid='' stopped='' code elapsed sig
-  local killed='' woke='' deadline_done='' stop_pid='' told='' wait_on=''
+  local killed='' woke='' deadline_done='' stop_pid='' told='' next_wait=''
 
   LABEL="${1:-}"
   shift
@@ -342,9 +342,9 @@ main() {
   {
     while :; do
       # Reset before the stop is looked for, so that a stop whose trap runs
-      # after this point leaves wait_on at $$ (see on_stop), and woke set.
+      # after this point leaves next_wait at $$ (see on_stop), and woke set.
       woke=''
-      wait_on="${pid}"
+      next_wait="${pid}"
       if [[ -n "${stopped}" && -n "${kill_after}" && -z "${deadline_done}" ]] \
         && kill -0 "${pid}"; then
         deadline_done=1
@@ -352,7 +352,7 @@ main() {
           killed=1
         fi
       fi
-      wait "${wait_on}"
+      wait "${next_wait}"
       code=$?
       [[ -n "${woke}" ]] || break
       kill -0 "${pid}" && continue
