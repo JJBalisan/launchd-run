@@ -117,7 +117,7 @@ trap 'echo USR1 >>\"\$1.usr1\"' USR1
 echo \$\$ >\"\$1\"
 while :; do /bin/sleep 0.1; done"
   env_file="${CASE_DIR}/env.bash"
-  lr56_env "${env_file}" 'wait*' 2 'kill -TERM $$'
+  lr56_env "${env_file}" 'wait\ *' 2 'kill -TERM $$'
   BASH_ENV="${env_file}" lr_stop_start svc --kill-after 2 -- \
     "${CASE_DIR}/job.sh" "${CASE_DIR}/child.pid"
   if ! lr_stop_wait_for "${CASE_DIR}/child.pid"; then
