@@ -35,6 +35,9 @@ bash tests/lr_env_select_env.sh
 bash tests/lr_count_select_edges.sh
 bash tests/lr_docs_verify_rotation.sh
 bash tests/lr_docs_select_boundary.sh
+bash tests/lr_56_fix.sh
+bash tests/lr_restack_env.sh
+bash tests/ci_runner.sh
 
 # step: Tests (/bin/bash 3.2, as launchd runs it)
 /bin/bash tests/version.sh
@@ -45,3 +48,6 @@ bash tests/lr_docs_select_boundary.sh
 /bin/bash tests/lr_count_select_edges.sh
 /bin/bash tests/lr_docs_verify_rotation.sh
 /bin/bash tests/lr_docs_select_boundary.sh
+/bin/bash tests/lr_56_fix.sh
+/bin/bash tests/lr_restack_env.sh
+/bin/bash tests/ci_runner.sh
