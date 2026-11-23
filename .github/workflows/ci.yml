@@ -9,15 +9,14 @@ on:
   pull_request:
 permissions:
   contents: read
-# A newer push to a PR cancels its older run, which would otherwise queue
-# on the repo's one self-hosted runner; runs on main always finish.
+# A newer push to a PR cancels its older run; runs on main always finish.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
-    runs-on: ${{ vars.CI_RUNNER || 'macos-latest' }}
+    runs-on: ${{ github.event_name == 'push' && vars.CI_RUNNER || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v7
       - name: CI (the same script runs locally)
