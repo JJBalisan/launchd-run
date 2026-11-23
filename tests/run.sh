@@ -39,6 +39,8 @@ leftover_pids=''
 CASE_HOME=''
 CASE_DIR=''
 RC=0
+# Read by launchd_stop: a SECONDS for the wrapper to inherit, if not empty.
+WRAPPER_SECONDS=''
 
 #######################################
 # Kills any job process a test left behind and removes the temp tree.
@@ -771,6 +773,268 @@ test_unexplained_signal_deaths() {
   done
 }
 
+#######################################
+# Stands in for launchd stopping a job (bootout, launchctl kill): starts the
+# wrapper in the background around a job, sends the wrapper SIGTERM once the
+# job is up and, as launchd does after ExitTimeOut, SIGKILL if the wrapper is
+# still there EXIT_TIMEOUT seconds later. Unlike stop_wrapper_with, the job
+# script writes its own pid file, so it can set its traps first.
+# Globals:
+#   RC (set to the wrapper's exit status)
+#   CHILD (set to the job's pid, or empty if the job never started)
+#   WRAPPER_KILLED (set to 1 if the stand-in had to SIGKILL the wrapper)
+#   STOP_SECONDS (set to the whole seconds from SIGTERM to the wrapper's end)
+#   STOP_MS (set to the same span in milliseconds, never understated)
+#   WRAPPER_SECONDS (read: if not empty, the wrapper inherits it as SECONDS)
+# Arguments:
+#   The stand-in's ExitTimeOut in seconds, the body of the job script (sh; it
+#   must write its pid to $1 once it is ready), then any wrapper options.
+#######################################
+launchd_stop() {
+  local exit_timeout="$1" body="$2" job pidfile wpid t0
+  local t0_ms
+  shift 2
+  job="${CASE_DIR}/job.sh"
+  pidfile="${CASE_DIR}/child.pid"
+  printf '#!/bin/sh\n%s\n' "${body}" >"${job}"
+  chmod +x "${job}"
+
+  env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
+    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
+    REPO_VERSION="${TEST_VERSION}" \
+    ${WRAPPER_SECONDS:+"SECONDS=${WRAPPER_SECONDS}"} \
+    "${WRAPPER}" svc "$@" -- "${job}" "${pidfile}" \
+    >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
+  wpid=$!
+
+  CHILD=''
+  WRAPPER_KILLED=0
+  STOP_SECONDS=0
+  if ! wait_for_file "${pidfile}"; then
+    kill -KILL "${wpid}" 2>/dev/null
+    wait "${wpid}" 2>/dev/null
+    return 1
+  fi
+  CHILD="$(cat "${pidfile}")"
+  leftover_pids="${leftover_pids} ${CHILD}"
+  # The job is ready; give the wrapper time to set its trap and reach its
+  # wait. A stop that lands before then is issue #27, not what is tested here.
+  sleep 1
+
+  # Read before the SIGTERM is sent, so STOP_MS can only overstate how long
+  # the wrapper took: a lower bound checked against it never fails falsely.
+  t0_ms="$(now_ms)"
+  t0="${SECONDS}"
+  kill -TERM "${wpid}"
+  # The braces keep bash's "Killed" report of the wrapper out of the output.
+  {
+    while kill -0 "${wpid}"; do
+      if ((SECONDS - t0 >= exit_timeout)); then
+        kill -KILL "${wpid}"
+        WRAPPER_KILLED=1
+        break
+      fi
+      sleep 0.1
+    done
+    wait "${wpid}"
+    RC=$?
+  } 2>/dev/null
+  STOP_SECONDS=$((SECONDS - t0))
+  STOP_MS=$(($(now_ms) - t0_ms))
+}
+
+# The clock in milliseconds (bash 3.2 has no EPOCHREALTIME, BSD date no %N).
+now_ms() {
+  /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'
+}
+
+stop_took_ms_at_least() { [ "${STOP_MS}" -ge "$1" ]; }
+stop_took_ms_at_most() { [ "${STOP_MS}" -le "$1" ]; }
+wrapper_killed() { [ "${WRAPPER_KILLED}" -eq 1 ]; }
+wrapper_not_killed() { [ "${WRAPPER_KILLED}" -eq 0 ]; }
+stop_took_at_least() { [ "${STOP_SECONDS}" -ge "$1" ]; }
+pid_alive() { kill -0 "$1" 2>/dev/null; }
+
+# Polls for up to ~3 s until no process is left sleeping for exactly $1
+# seconds. Any that remain are queued for cleanup.
+no_sleep_left() {
+  local i=0 strays
+  strays="$(pgrep -f "sleep $1\$")"
+  while [ -n "${strays}" ] && [ "${i}" -lt 30 ]; do
+    sleep 0.1
+    i=$((i + 1))
+    strays="$(pgrep -f "sleep $1\$")"
+  done
+  leftover_pids="${leftover_pids} ${strays}"
+  [ -z "${strays}" ]
+}
+
+# Issue #24: --kill-after is validated the way --after is, and neither
+# option disturbs the other or an ordinary run.
+test_kill_after_arguments() {
+  local marker value
+  echo '# #24: --kill-after arguments'
+
+  new_case
+  run_wrap
+  check 'no arguments: usage names --kill-after' err_has '[--kill-after '
+
+  new_case
+  run_wrap job --kill-after
+  check '--kill-after with no value: exit 64' rc_is 64
+  check '--kill-after with no value: says what it needs' \
+    err_has '--kill-after needs a positive integer'
+
+  new_case
+  run_wrap job --kill-after 3
+  check '--kill-after N with no command: exit 64' rc_is 64
+  check '--kill-after N with no command: "no command given"' \
+    err_has 'no command given'
+
+  for value in abc 0 -1 1x 1.5 ''; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    run_wrap job --kill-after "${value}" -- /usr/bin/touch "${marker}"
+    check "--kill-after '${value}': rejected with exit 64" rc_is 64
+    check "--kill-after '${value}': says what it needs" \
+      err_has "--kill-after needs a positive integer, got '${value}'"
+    check "--kill-after '${value}': command not run" path_absent "${marker}"
+    check "--kill-after '${value}': no state written" state_dir_absent
+  done
+
+  # More than 9 digits is refused. A deadline that large is never reached,
+  # and one big enough to wrap bash's arithmetic round to the past would
+  # kill the job the moment it is stopped.
+  for value in 1000000000 99999999999999999999; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    run_wrap job --kill-after "${value}" -- /usr/bin/touch "${marker}"
+    check "--kill-after ${value}: rejected with exit 64" rc_is 64
+    check "--kill-after ${value}: says the limit" \
+      err_has "--kill-after takes at most 9 digits, got '${value}'"
+    check "--kill-after ${value}: command not run" path_absent "${marker}"
+    check "--kill-after ${value}: no state written" state_dir_absent
+  done
+
+  new_case
+  run_wrap job --kill-after 999999999 -- /usr/bin/true
+  check '--kill-after 999999999, the most allowed: exit 0' rc_is 0
+
+  new_case
+  marker="${CASE_DIR}/ran"
+  run_wrap job --kill-after 5 -- /usr/bin/touch "${marker}"
+  check '--kill-after 5, job ends by itself: exit 0' rc_is 0
+  check '--kill-after 5, job ends by itself: command ran' test -e "${marker}"
+  check '--kill-after 5, job ends by itself: logged ok' audit_has 'ok ('
+  check '--kill-after 5, job ends by itself: nothing on stderr' err_empty
+
+  new_case
+  run_wrap job --after 1 --kill-after 5 -- /usr/bin/false
+  check '--after 1 --kill-after 5: exit 1 passed through' rc_is 1
+  check '--after 1 --kill-after 5: banner at the --after threshold' \
+    calls_are 1
+
+  new_case
+  run_wrap job --kill-after 5 --after 1 -- /usr/bin/false
+  check '--kill-after 5 --after 1: exit 1 passed through' rc_is 1
+  check '--kill-after 5 --after 1: banner at the --after threshold' \
+    calls_are 1
+}
+
+# Issue #24: launchd SIGKILLs the wrapper, and only the wrapper, once
+# ExitTimeOut has passed, so a job that ignores SIGTERM outlives it as an
+# orphan with no outcome line. With --kill-after N the wrapper SIGKILLs the
+# job itself N seconds after forwarding SIGTERM, reaps it and logs the stop,
+# all before launchd's SIGKILL is due.
+test_kill_deadline() {
+  local body timer_secs
+  echo '# #24: job ignores SIGTERM, --kill-after 2: killed, reaped, logged'
+  new_case
+  seed_counter svc 1
+  # One process, so nothing here depends on grandchildren (issue #44).
+  body="trap '' TERM; echo \$\$ >\"\$1\"; exec /bin/sleep 120"
+  if ! launchd_stop 20 "${body}" --kill-after 2; then
+    check '#24 deadline: wrapper started the job' false
+  else
+    check '#24 deadline: wrapper finished before the launcher SIGKILL' \
+      wrapper_not_killed
+    check '#24 deadline: job gone, not orphaned' pid_gone "${CHILD}"
+    check '#24 deadline: job had its 2 s first' stop_took_at_least 2
+    check '#24 deadline: and not a moment less than 2 s' \
+      stop_took_ms_at_least 2000
+    # Due inside 3 s by the clock; the rest is room for a loaded machine.
+    check '#24 deadline: and no more than 10 s' stop_took_ms_at_most 10000
+    check '#24 deadline: exit 137 passed through' rc_is 137
+    check '#24 deadline: outcome line names the SIGKILL' \
+      audit_has 'stopped by signal, SIGKILL after 2s (exit 137, '
+    check '#24 deadline: outcome line says not counted' \
+      audit_has 's) - not counted'
+    check '#24 deadline: not logged as a failure' audit_lacks 'FAILED'
+    check '#24 deadline: streak of 1 untouched' counter_is svc 1
+    check '#24 deadline: no banner' calls_are 0
+    check '#24 deadline: no job-control noise on stderr' err_empty
+  fi
+
+  echo '# #24: a SECONDS the wrapper inherits cannot bring the deadline forward'
+  new_case
+  body="trap '' TERM; echo \$\$ >\"\$1\"; exec /bin/sleep 120"
+  # Six below the top of bash's arithmetic. Once the wrapper has run for a
+  # second, a 5 s deadline and its extra tick added to that wrap round to
+  # the past, and the job would be killed the moment it is stopped. (After
+  # seven seconds SECONDS itself has wrapped and the case shows nothing.)
+  WRAPPER_SECONDS=9223372036854775801
+  if ! launchd_stop 20 "${body}" --kill-after 5; then
+    check '#24 inherited SECONDS: wrapper started the job' false
+  else
+    check '#24 inherited SECONDS: job still had its 5 s' \
+      stop_took_ms_at_least 5000
+    check '#24 inherited SECONDS: killed at the deadline all the same' \
+      audit_has 'stopped by signal, SIGKILL after 5s (exit 137, '
+    check '#24 inherited SECONDS: wrapper done before the launcher SIGKILL' \
+      wrapper_not_killed
+    check '#24 inherited SECONDS: job gone' pid_gone "${CHILD}"
+  fi
+  WRAPPER_SECONDS=''
+
+  echo '# #24: job shuts down within the deadline: not killed, no waiting'
+  new_case
+  seed_counter svc 1
+  # A deadline no other run of this suite uses, and far past the stand-in's
+  # 20 s: a wrapper that waited it out, or left its timer behind, is caught.
+  timer_secs=$((100000 + $$))
+  body="trap 'kill \$!; /bin/sleep 1; exit 3' TERM; /bin/sleep 120 &
+echo \$\$ >\"\$1\"; wait \$!"
+  if ! launchd_stop 20 "${body}" --kill-after "${timer_secs}"; then
+    check '#24 in time: wrapper started the job' false
+  else
+    check '#24 in time: wrapper did not wait out the deadline' \
+      wrapper_not_killed
+    check '#24 in time: job exit 3 passed through, not 137' rc_is 3
+    check '#24 in time: logged as an ordinary stop' \
+      audit_has 'stopped by signal (exit 3, '
+    check '#24 in time: no SIGKILL logged' audit_lacks 'SIGKILL'
+    check '#24 in time: streak of 1 untouched' counter_is svc 1
+    check '#24 in time: no banner' calls_are 0
+    check '#24 in time: job gone' pid_gone "${CHILD}"
+    check '#24 in time: no deadline timer left behind' \
+      no_sleep_left "${timer_secs}"
+    check '#24 in time: no job-control noise on stderr' err_empty
+  fi
+
+  echo '# #24: without --kill-after nothing changes: the wrapper keeps waiting'
+  new_case
+  body="trap '' TERM; echo \$\$ >\"\$1\"; exec /bin/sleep 120"
+  if ! launchd_stop 3 "${body}"; then
+    check '#24 no option: wrapper started the job' false
+  else
+    check '#24 no option: wrapper still waiting at the launcher SIGKILL' \
+      wrapper_killed
+    check '#24 no option: job left alone' pid_alive "${CHILD}"
+    check '#24 no option: no outcome line' audit_lacks 'stopped by signal'
+    kill -KILL "${CHILD}" 2>/dev/null
+  fi
+}
+
 test_log_rotation() {
   echo '# audit log trimmed to its last 5000 lines once past 1 MB'
   new_case
@@ -822,6 +1086,8 @@ main() {
   test_signal_to_wrapper
   test_stop_classified_by_wrapper
   test_unexplained_signal_deaths
+  test_kill_after_arguments
+  test_kill_deadline
   test_log_rotation
 
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"

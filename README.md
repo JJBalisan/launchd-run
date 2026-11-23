@@ -5,7 +5,7 @@ A wrapper that makes launchd job failures visible. Without it a broken job exits
 unnoticed.
 
 ```text
-launchd-run.sh LABEL [--after N] -- command [args...]
+launchd-run.sh LABEL [--after N] [--kill-after SECONDS] -- command [args...]
 ```
 
 Runs the command, passes stdout, stderr and the exit code straight through, and
@@ -20,7 +20,9 @@ recovers. `N` must be a positive integer; anything else is a usage error
 plain decimal number reads as 0, so a corrupt one restarts the streak rather
 than breaking the wrapper. A counter that cannot be written at all (say, a
 root-owned `~/.local/state`) raises a banner on every failure instead, and one
-that cannot be cleared raises no "Back to normal" banner.
+that cannot be cleared raises no "Back to normal" banner. `--kill-after` is
+for a command that ignores SIGTERM; see
+["A command that ignores SIGTERM"](#a-command-that-ignores-sigterm).
 
 ## Install
 
@@ -59,9 +61,60 @@ launchd stops a job by signalling its main process, which with the wrapper in
 front is the wrapper itself. The wrapper traps SIGHUP, SIGINT and SIGTERM,
 forwards SIGTERM to the command, waits for it to exit and then logs the stop
 (`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line and
-no orphaned command. A command that handles SIGTERM is logged as stopped
+no orphaned command, provided the command exits on SIGTERM (the next section
+covers one that does not). A command that handles SIGTERM is logged as stopped
 whatever code it exits with, 0 or 1 included. One side effect: the command runs as a background job of the wrapper, so
 it starts with SIGINT and SIGQUIT ignored.
+
+## A command that ignores SIGTERM
+
+To stop a job, launchd sends SIGTERM to its main process and, if that process
+is still there `ExitTimeOut` seconds later, SIGKILL. With the wrapper in front,
+both land on the wrapper. It forwards the SIGTERM, but a SIGKILL cannot be
+trapped: when the command ignores SIGTERM, the wrapper is killed while it is
+still waiting, the command lives on as an orphan that launchd no longer knows
+about, and the audit log holds a start line with no outcome. launchd's sweep of
+the process group afterwards sends only one more SIGTERM (seen on macOS 27.0.1,
+[#24](https://github.com/JJBalisan/launchd-run/issues/24)).
+
+`--kill-after SECONDS` gives the wrapper a deadline of its own. If the command
+is still running `SECONDS` seconds after the wrapper forwarded SIGTERM, the
+wrapper sends it SIGKILL (never sooner, and about a second later at the most),
+reaps it, logs
+
+```text
+stopped by signal, SIGKILL after 15s (exit 137, 86400s) - not counted
+```
+
+and exits 137. Like any other stop, this neither raises the counter nor clears
+a streak. A command that exits before the deadline is left alone and logged as
+an ordinary stop. Without the option nothing changes: the wrapper waits for the
+command for as long as it takes.
+
+```text
+[ ~/.local/bin/launchd-run.sh, com.example.server, --kill-after, 15, --,
+  ~/bin/server ]
+```
+
+goes with `<key>ExitTimeOut</key><integer>20</integer>` in the same plist.
+
+- `SECONDS` is a positive integer of at most 9 digits; anything else is a
+  usage error (exit 64) and the command is not run.
+- It must be below the plist's `ExitTimeOut` by a few seconds: the SIGKILL can
+  land a little over a second after `SECONDS` (the wrapper's clock ticks in
+  whole seconds and it looks ten times a second), and the wrapper then needs a
+  moment to reap the command and write its line. At or above `ExitTimeOut` the
+  option does nothing, because launchd kills the wrapper first.
+- Set `ExitTimeOut` in the plist rather than relying on the default, which
+  `man launchd.plist` only calls "system-defined". The wrapper cannot read the
+  plist, which is why it is told the number.
+- The SIGKILL goes to the command's own pid, as the forwarded SIGTERM does.
+  Processes the command started are not signalled
+  ([#44](https://github.com/JJBalisan/launchd-run/issues/44)).
+- The deadline starts when the wrapper, already waiting on the command, is
+  signalled. A stop in the first instant of a run, before the wrapper waits,
+  is not covered
+  ([#27](https://github.com/JJBalisan/launchd-run/issues/27)).
 
 ## Log rotation
 
