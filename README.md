@@ -75,10 +75,23 @@ covers one that does not). A command that handles SIGTERM is logged as stopped
 whatever code it exits with, 0 or 1 included. Further SIGHUP, SIGINT or
 SIGTERM during the shutdown are forwarded as SIGTERM again; the wrapper logs
 and exits only once the command has exited, with the command's own status.
-The traps are in place before the command is forked. A stop that arrives
-before it has started means it is never started: the wrapper logs
+The traps are in place before the command is forked. A stop the wrapper has
+seen by the time it forks the command means the command is never run (the
+forked process checks for it before it execs the command): the wrapper logs
 `stopped by signal before the job started - not counted`, leaves the counter
-alone and exits with 128 plus the signal number.
+alone and exits with 128 plus the signal number. A stop after the fork is
+forwarded as SIGTERM, which ends the command whether or not it has been
+exec'd yet, and is logged as any other stop. (If it lands in the first instant
+after the fork, bash 3.2 prints two `run_pending_traps` warnings on the
+command's stderr as it passes the SIGTERM on.)
+
+One instant is not covered. bash acts on a trapped signal only between
+commands, and the wrapper's `wait` is a command: a stop that lands after bash
+has looked for signals on its way into that `wait`, but before the `wait`
+blocks (a few instructions, read from the source of bash 3.2, the version
+launchd runs; not reproduced), is acted on only when the `wait` ends, which is
+when the command exits or another signal reaches the wrapper. Until then the
+command is not told, and a `--kill-after` deadline does not start.
 
 Other signals sent to the wrapper do not end it either:
 
@@ -137,8 +150,9 @@ goes with `<key>ExitTimeOut</key><integer>20</integer>` in the same plist.
 - The SIGKILL goes to the command's own pid, as the forwarded SIGTERM does.
   Processes the command started are not signalled
   ([#44](https://github.com/JJBalisan/launchd-run/issues/44)).
-- The deadline starts when the wrapper first sees the stop, and is not
-  restarted by later signals.
+- The deadline starts when the wrapper first sees the stop, wherever it is
+  in its wait loop, and is not restarted by later signals. A stop that lands
+  in the one instant described above is seen only when that `wait` ends.
 
 ## Log rotation
 
