@@ -133,6 +133,33 @@ forward_signal() {
 }
 
 #######################################
+# Records a stop and forwards it to the job as SIGTERM, if the job has been
+# started. Called from the traps.
+# Globals:
+#   stopped, stop_pid, told (main's, set); pid (main's, read)
+# Arguments:
+#   The signal number.
+#######################################
+# shellcheck disable=SC2329 # invoked from the traps in main
+on_stop() {
+  # $! names the job only once it has been forked, so it tells which side of
+  # the fork the first stop reached the wrapper on.
+  if [[ -z "${stopped}" ]]; then
+    # Until a job has been forked, bash 3.2 rejects $! under set -u even
+    # with a default.
+    set +u
+    stop_pid="$!"
+    set -u
+  fi
+  stopped="$1"
+  if [[ -n "${pid}" ]]; then
+    kill -s TERM "${pid}" 2>/dev/null
+    told=1
+  fi
+  return 0
+}
+
+#######################################
 # Enforces --kill-after on a job that has been sent SIGTERM: returns once the
 # job has exited, or sends it SIGKILL when the deadline passes first. The
 # deadline is read off SECONDS, bash's clock, not counted in polls, so it
@@ -184,7 +211,7 @@ kill_at_deadline() {
 main() {
   local alert_after=2 kill_after=''
   local state fails_file prev fails started pid='' stopped='' code elapsed sig
-  local killed='' woke='' deadline_done=''
+  local killed='' woke='' deadline_done='' stop_pid='' told=''
 
   LABEL="${1:-}"
   shift
@@ -229,14 +256,15 @@ main() {
     usage_error 'no command given'
   fi
 
-  # The stop traps go in before anything is forked, so that a stop at any
-  # later point is recorded and never takes its default action, which would
-  # kill the wrapper and orphan the job. They hold the signal number for the
-  # exit status of a stop before the job has started, and set woke so that a
-  # wait they interrupt is told from one that ended with the job.
-  trap 'stopped=1; woke=1; forward_signal TERM' HUP
-  trap 'stopped=2; woke=1; forward_signal TERM' INT
-  trap 'stopped=15; woke=1; forward_signal TERM' TERM
+  # The stop traps go in before the job, or any command of main's, is
+  # forked, so that a stop at any later point is recorded and never takes its
+  # default action, which would kill the wrapper and orphan the job. They
+  # hold the signal number for the exit status of a stop before the job has
+  # started, and set woke so that a wait they interrupt is told from one that
+  # ended with the job.
+  trap 'woke=1; on_stop 1' HUP
+  trap 'woke=1; on_stop 2' INT
+  trap 'woke=1; on_stop 15' TERM
   trap 'woke=1; forward_signal USR1' USR1
   trap 'woke=1; forward_signal USR2' USR2
   trap 'woke=1; forward_signal ALRM' ALRM
@@ -260,10 +288,6 @@ main() {
   note "started: launchd-run $(repo_version)"
 
   started="$(date +%s)"
-  if [[ -n "${stopped}" ]]; then
-    note "stopped by signal before the job started - not counted"
-    exit $((128 + stopped))
-  fi
   # The job runs in the background so that a stop signal reaches the wrapper's
   # trap instead of killing it outright. <&0 keeps stdin attached, which bash
   # would otherwise replace with /dev/null for a background job. One side
@@ -271,18 +295,37 @@ main() {
   # ignored, and the job inherits that. launchd stops a job with SIGTERM and
   # then, once ExitTimeOut has passed, SIGKILL; the SIGKILL hits the wrapper
   # alone and cannot be trapped, which is what --kill-after is for.
-  "$@" <&0 &
+  #
+  # The job is exec'd from a subshell rather than run as a plain background
+  # command. The forked process inherits a copy of stopped, so a stop the
+  # wrapper has recorded by the fork means the job is never run. And the
+  # subshell resets the wrapper's traps before the exec: under bash 3.2 a
+  # background command would still hold them while it looks the command up,
+  # and a SIGTERM forwarded then would be caught and lost at the exec. One
+  # caught in the instant before the reset is sent again by bash to the
+  # subshell, now with its default action (bash prints two warnings about
+  # it), so a stop forwarded at any point ends the job, before or after it
+  # has exec'd.
+  (
+    [[ -z "${stopped}" ]] || exit "$((128 + stopped))"
+    exec "$@"
+  ) <&0 &
   pid=$!
   trap '' PIPE
-  # A stop that came after the check above but before the pid was known was
-  # recorded and could not be forwarded. Send it now, and again a few times:
-  # a job that has not yet exec'd can still be running the wrapper's own
-  # handler, which would swallow the signal.
   if [[ -n "${stopped}" ]]; then
-    for _ in 1 2 3; do
-      kill -TERM "${pid}" 2>/dev/null || break
-      /bin/sleep 0.1
-    done 2>/dev/null
+    if [[ "${stop_pid}" != "${pid}" ]]; then
+      # The first stop came before the fork: the subshell saw it and exits
+      # without running the job.
+      trap '' HUP INT TERM USR1 USR2 ALRM
+      wait "${pid}" 2>/dev/null
+      note "stopped by signal before the job started - not counted"
+      exit $((128 + stopped))
+    fi
+    # It came after the fork but before the pid was known, so no SIGTERM has
+    # been forwarded yet. The job gets it now.
+    if [[ -z "${told}" ]]; then
+      kill -TERM "${pid}" 2>/dev/null
+    fi
   fi
   # A trapped signal interrupts wait with 128+signal while the job is still
   # running, so the job is waited for again until it has gone, and the wait

@@ -66,10 +66,13 @@ covers one that does not). A command that handles SIGTERM is logged as stopped
 whatever code it exits with, 0 or 1 included. Further SIGHUP, SIGINT or
 SIGTERM during the shutdown are forwarded as SIGTERM again; the wrapper logs
 and exits only once the command has exited, with the command's own status.
-The traps are in place before the command is forked. A stop that arrives
-before it has started means it is never started: the wrapper logs
+The traps are in place before the command is forked. A stop the wrapper has
+seen by the time it forks the command means the command is never run (the
+forked process checks for it before it execs the command): the wrapper logs
 `stopped by signal before the job started - not counted`, leaves the counter
-alone and exits with 128 plus the signal number.
+alone and exits with 128 plus the signal number. A stop after the fork is
+forwarded as SIGTERM, which ends the command whether or not it has been
+exec'd yet, and is logged as any other stop.
 
 Other signals sent to the wrapper do not end it either:
 
