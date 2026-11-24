@@ -131,7 +131,8 @@ note() {
 # past AUDIT_MAX_BYTES. The trimmed copy is written beside the log and renamed
 # over it, so a reader never sees a torn file; a line another job appends
 # during the rename can be lost, which is accepted. The trim is noted in the
-# log so the gap is explained.
+# log so the gap is explained, and so is a trim that fails (a Logs directory
+# that cannot be written to): its errors stay off the job's stderr.
 # Globals:
 #   AUDIT
 #######################################
@@ -140,11 +141,12 @@ rotate_audit() {
   size="$(/usr/bin/stat -f%z "${AUDIT}" 2>/dev/null)" || return 0
   ((size > AUDIT_MAX_BYTES)) || return 0
   tmp="${AUDIT}.$$"
-  if tail -n "${AUDIT_KEEP_LINES}" "${AUDIT}" >"${tmp}" \
-    && /bin/mv -f "${tmp}" "${AUDIT}"; then
+  if { tail -n "${AUDIT_KEEP_LINES}" "${AUDIT}" >"${tmp}" \
+    && /bin/mv -f "${tmp}" "${AUDIT}"; } 2>/dev/null; then
     note "audit log trimmed to the last ${AUDIT_KEEP_LINES} lines"
   else
-    rm -f "${tmp}"
+    rm -f "${tmp}" 2>/dev/null
+    note "audit log past ${AUDIT_MAX_BYTES} bytes and cannot be trimmed"
   fi
 }
 

@@ -63,7 +63,7 @@ test_lr58_unwritable_log() {
 
 # A log past the trim size in a Logs directory that cannot be written to
 # (the log itself can): the trim fails without a word on the job's stderr,
-# and the run is still logged.
+# the failure is noted in the log, and the run is still logged.
 test_lr58_trim_fails() {
   echo '# lr-58: a trim that cannot write its temp file'
   new_case
@@ -73,7 +73,9 @@ test_lr58_trim_fails() {
   chmod 755 "${CASE_HOME}/Library/Logs"
   check 'lr-58: trim fails: exits 0' rc_is 0
   check 'lr-58: trim fails: stderr empty' err_empty
-  check 'lr-58: trim fails: the run is logged' audit_lines_are 250002
+  check 'lr-58: trim fails: noted in the log' \
+    audit_line_has 250001 'cannot be trimmed'
+  check 'lr-58: trim fails: the run is logged' audit_lines_are 250003
 }
 
 main() {

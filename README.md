@@ -193,7 +193,9 @@ of 84 bytes a line and 270 lines a day, measured on a live log in November
 2026) it keeps the last 100,000 lines, about a year: the trimmed copy is
 written beside the log and renamed over it, and the trim is noted in the log.
 A line another job appends during that rename can be lost, which is accepted
-for an audit trail of this kind. Nothing in `/etc/newsyslog.d` is needed.
+for an audit trail of this kind. A trim that fails (a `~/Library/Logs` the
+wrapper cannot write to) is noted in the log and tried again on the next run.
+Nothing in `/etc/newsyslog.d` is needed.
 
 ## Releasing
 
