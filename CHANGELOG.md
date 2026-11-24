@@ -13,6 +13,8 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-24
+
 ### Added
 
 - `--kill-after SECONDS`, an opt-in kill deadline for a job that ignores
@@ -24,6 +26,38 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
   `stopped by signal, SIGKILL after Ns (exit 137, ...) - not counted`. Set it
   a few seconds below the plist's `ExitTimeOut`. `SECONDS` is a positive
   integer of at most 9 digits. Without the option nothing changes.
+
+### Changed
+
+- An unremovable fail count is now reset to 0 on success, so the recovery
+  is reported once with the "Back to normal" banner where it was silently
+  skipped before (#48). This changes when the wrapper alerts, hence MAJOR.
+- The command is exec'd with the caller's environment and looked up on
+  `PATH`, so a shell builtin (`-- eval ...`, `-- :`) no longer works as the
+  command (#27, #30).
+- USR1, USR2 and ALRM are passed on to the command; PIPE and QUIT no longer
+  end the wrapper (#37).
+- Without `HOME` the command runs directly with a warning and no
+  bookkeeping, instead of the wrapper aborting (#26).
+- The audit log is trimmed once past 16 MB, to its last 100,000 lines (was
+  1 MB and 5,000) (#36).
+- The README now says what `alert sent` means (#31), what happens to a
+  command's children on a stop (#44), that macOS 12.3 or later is required
+  (#47), and what `kill 0` in a job does to the wrapper (#38).
+
+### Fixed
+
+- A stop before the job is forked, or just after, is no longer lost or
+  fatal; one small window inside bash 3.2's `wait` remains and is
+  described in the README (#27).
+- Repeated stops no longer end the wrapper before the job has gone (#25).
+- A caller's variable named like one of the wrapper's reaches the job
+  unchanged (#23).
+- A command named like a wrapper function runs the program on `PATH`
+  (#30).
+- `--after` takes at most 9 digits; a longer stored fail count restarts
+  the streak (#45).
+- A label with `/` or a leading `.` is a usage error (#46).
 
 ## [2.0.0] - 2026-11-20
 
@@ -116,7 +150,8 @@ audit fixes (#8) and the single-script CI (#9).
   `tests/version.sh` for the lib; `tests/ci.sh` is the whole CI as one
   script and the workflow's only step (#9), linting every tracked `.sh`.
 
-[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/JJBalisan/launchd-run/compare/v2.0.0...v3.0.0
 [2.0.0]: https://github.com/JJBalisan/launchd-run/compare/v1.0.4...v2.0.0
 [1.0.4]: https://github.com/JJBalisan/launchd-run/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/JJBalisan/launchd-run/compare/v1.0.2...v1.0.3
