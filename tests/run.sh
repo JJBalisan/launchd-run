@@ -39,6 +39,8 @@ leftover_pids=''
 CASE_HOME=''
 CASE_DIR=''
 RC=0
+# Set by wrap_env.
+WRAP_ENV=()
 # Read by launchd_stop: a SECONDS for the wrapper to inherit, if not empty.
 WRAPPER_SECONDS=''
 
@@ -103,6 +105,24 @@ new_case() {
 }
 
 #######################################
+# Sets WRAP_ENV to the env command every run of the wrapper in the current
+# case starts with: the case's HOME, the stub osascript first on PATH, where
+# the stub records its calls and how it exits, and the pinned version. Every
+# launcher builds on this one list, so a change to it reaches them all.
+# Globals:
+#   WRAP_ENV (set); CASE_HOME, CASE_DIR, OSASCRIPT_EXIT (read)
+# Arguments:
+#   A directory to put first on PATH, if any.
+#######################################
+wrap_env() {
+  WRAP_ENV=(env "HOME=${CASE_HOME}"
+    "PATH=${1:+$1:}${STUB_BIN}:${SYS_PATH}"
+    "OSASCRIPT_CALLS=${CASE_DIR}/osascript.calls"
+    "OSASCRIPT_EXIT=${OSASCRIPT_EXIT:-0}"
+    "REPO_VERSION=${TEST_VERSION}")
+}
+
+#######################################
 # Runs the wrapper inside the current case.
 # Globals:
 #   RC (set to the wrapper's exit status)
@@ -112,10 +132,8 @@ new_case() {
 #   Wrapper stdout and stderr go to $CASE_DIR/out and $CASE_DIR/err.
 #######################################
 run_wrap() {
-  env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    OSASCRIPT_EXIT="${OSASCRIPT_EXIT:-0}" REPO_VERSION="${TEST_VERSION}" \
-    "${WRAPPER}" "$@" >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
+  wrap_env
+  "${WRAP_ENV[@]}" "${WRAPPER}" "$@" >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
   RC=$?
 }
 
@@ -130,12 +148,10 @@ run_wrap() {
 #   Arguments for launchd-run.sh.
 #######################################
 run_wrap_raw() {
+  wrap_env
   # shellcheck disable=SC2016  # $? and $f belong to perl.
   (cd "${CASE_DIR}" \
-    && env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-      OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-      REPO_VERSION="${TEST_VERSION}" \
-      /usr/bin/perl -e 'my $f = shift; system(@ARGV);
+    && "${WRAP_ENV[@]}" /usr/bin/perl -e 'my $f = shift; system(@ARGV);
         open(my $h, ">", $f) or die; print $h ($? & 127);
         exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' \
       "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
@@ -645,10 +661,8 @@ stop_wrapper_with() {
   # env execs the wrapper, so $! is the wrapper's own bash. SIGINT is not
   # tested: a non-interactive shell starts async jobs with SIGINT ignored,
   # so the wrapper could neither receive nor trap it from here.
-  env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    REPO_VERSION="${TEST_VERSION}" \
-    "${WRAPPER}" svc -- "${job}" "${pidfile}" \
+  wrap_env
+  "${WRAP_ENV[@]}" "${WRAPPER}" svc -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
 
@@ -801,11 +815,11 @@ launchd_stop() {
   printf '#!/bin/sh\n%s\n' "${body}" >"${job}"
   chmod +x "${job}"
 
-  env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    REPO_VERSION="${TEST_VERSION}" \
-    ${WRAPPER_SECONDS:+"SECONDS=${WRAPPER_SECONDS}"} \
-    "${WRAPPER}" svc "$@" -- "${job}" "${pidfile}" \
+  wrap_env
+  if [ -n "${WRAPPER_SECONDS}" ]; then
+    WRAP_ENV+=("SECONDS=${WRAPPER_SECONDS}")
+  fi
+  "${WRAP_ENV[@]}" "${WRAPPER}" svc "$@" -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
 
@@ -1177,12 +1191,11 @@ lr_stop_gate() {
 #######################################
 lr_stop_start() {
   /bin/rm -f "${CASE_DIR}/wrapper.pid" "${CASE_DIR}/killed-by"
+  wrap_env "${LR_PATH_PREFIX}"
+  WRAP_ENV+=("LR_G_DIR=${CASE_DIR}" "LR_G_CMD=${LR_GATE_CMD}"
+    "LR_G_ARG=${LR_GATE_ARG}")
   # shellcheck disable=SC2016  # $SIG, $p, $s and the rest belong to perl.
-  env HOME="${CASE_HOME}" \
-    PATH="${LR_PATH_PREFIX:+${LR_PATH_PREFIX}:}${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    REPO_VERSION="${TEST_VERSION}" LR_G_DIR="${CASE_DIR}" \
-    LR_G_CMD="${LR_GATE_CMD}" LR_G_ARG="${LR_GATE_ARG}" \
+  "${WRAP_ENV[@]}" \
     /usr/bin/perl -e '$SIG{INT} = $SIG{QUIT} = $SIG{PIPE} = "DEFAULT";
       my ($pf, $kf) = splice(@ARGV, 0, 2);
       my $p = fork();
