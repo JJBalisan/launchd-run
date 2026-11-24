@@ -38,6 +38,11 @@ leftover_pids=''
 # Set by new_case and run_wrap.
 CASE_HOME=''
 CASE_DIR=''
+# The case's audit log, stub osascript record and state directory: the one
+# spelling of each path.
+CASE_LOG=''
+CASE_CALLS=''
+CASE_STATE=''
 RC=0
 # Set by wrap_env.
 WRAP_ENV=()
@@ -95,12 +100,15 @@ EOF
 #######################################
 # Starts a fresh case: a new temp HOME with ~/Library/Logs (as on macOS).
 # Globals:
-#   CASE_DIR, CASE_HOME
+#   CASE_DIR, CASE_HOME, CASE_LOG, CASE_CALLS, CASE_STATE
 #######################################
 new_case() {
   case_n=$((case_n + 1))
   CASE_DIR="${TMP_ROOT}/case${case_n}"
   CASE_HOME="${CASE_DIR}/home"
+  CASE_LOG="${CASE_HOME}/Library/Logs/launchd-run.log"
+  CASE_CALLS="${CASE_DIR}/osascript.calls"
+  CASE_STATE="${CASE_HOME}/.local/state/launchd-run"
   mkdir -p "${CASE_HOME}/Library/Logs"
 }
 
@@ -117,7 +125,7 @@ new_case() {
 wrap_env() {
   WRAP_ENV=(env "HOME=${CASE_HOME}"
     "PATH=${1:+$1:}${STUB_BIN}:${SYS_PATH}"
-    "OSASCRIPT_CALLS=${CASE_DIR}/osascript.calls"
+    "OSASCRIPT_CALLS=${CASE_CALLS}"
     "OSASCRIPT_EXIT=${OSASCRIPT_EXIT:-0}"
     "REPO_VERSION=${TEST_VERSION}")
 }
@@ -164,7 +172,7 @@ run_wrap_raw() {
 # Path of a label's fail counter in the current case.
 #######################################
 counter_file() {
-  printf '%s' "${CASE_HOME}/.local/state/launchd-run/$1/fail-count"
+  printf '%s' "${CASE_STATE}/$1/fail-count"
 }
 
 #######################################
@@ -173,7 +181,7 @@ counter_file() {
 #   Label, contents.
 #######################################
 seed_counter() {
-  mkdir -p "${CASE_HOME}/.local/state/launchd-run/$1"
+  mkdir -p "${CASE_STATE}/$1"
   printf '%s' "$2" >"$(counter_file "$1")"
 }
 
@@ -190,42 +198,40 @@ counter_is() {
 
 counter_absent() { [ ! -e "$(counter_file "$1")" ]; }
 
-calls() {
-  local f="${CASE_DIR}/osascript.calls"
-  if [ -f "${f}" ]; then
-    wc -l <"${f}" | tr -d ' '
+# Lines in a file, 0 if it is missing.
+file_lines() {
+  if [ -f "$1" ]; then
+    wc -l <"$1" | tr -d ' '
   else
     echo 0
   fi
 }
 
-calls_are() { [ "$(calls)" -eq "$1" ]; }
-
-# Line N of the osascript record contains the fixed string.
-call_has() {
-  local n="$1" want="$2" line
-  line="$(sed -n "${n}p" "${CASE_DIR}/osascript.calls" 2>/dev/null)"
+# Line N of a file contains the fixed string (false if the file is missing).
+file_line_has() {
+  local line
+  line="$(sed -n "$2p" "$1" 2>/dev/null)"
   case "${line}" in
-    *"${want}"*) return 0 ;;
+    *"$3"*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+calls() { file_lines "${CASE_CALLS}"; }
+
+calls_are() { [ "$(calls)" -eq "$1" ]; }
+
+# Line N of the osascript record contains the fixed string.
+call_has() { file_line_has "${CASE_CALLS}" "$1" "$2"; }
+
 audit_has() {
-  grep -F -q -- "$1" "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
+  grep -F -q -- "$1" "${CASE_LOG}" 2>/dev/null
 }
 
 audit_lacks() { ! audit_has "$1"; }
 
 # Line N of the audit log contains the fixed string.
-audit_line_has() {
-  local line
-  line="$(sed -n "$1p" "${CASE_HOME}/Library/Logs/launchd-run.log")"
-  case "${line}" in
-    *"$2"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+audit_line_has() { file_line_has "${CASE_LOG}" "$1" "$2"; }
 
 # Nothing but the audit log sits in ~/Library/Logs (no temp file left over).
 logs_dir_has_only_audit() {
@@ -240,20 +246,17 @@ seed_audit_lines() {
     for (i = 1; i <= n; i++) {
       printf "2026-01-01 00:00:00  seed%-34s line %05d\n", "", i
     }
-  }' >"${CASE_HOME}/Library/Logs/launchd-run.log"
+  }' >"${CASE_LOG}"
 }
 
-audit_lines_are() {
-  local f="${CASE_HOME}/Library/Logs/launchd-run.log" n=0
-  [ -f "${f}" ] && n="$(wc -l <"${f}" | tr -d ' ')"
-  [ "${n}" -eq "$1" ]
-}
+audit_lines_are() { [ "$(file_lines "${CASE_LOG}")" -eq "$1" ]; }
 
 err_has() { grep -F -q -- "$1" "${CASE_DIR}/err"; }
 err_empty() { [ ! -s "${CASE_DIR}/err" ]; }
 out_is() { [ "$(cat "${CASE_DIR}/out")" = "$1" ]; }
 path_absent() { [ ! -e "$1" ]; }
-state_dir_absent() { [ ! -e "${CASE_HOME}/.local/state/launchd-run" ]; }
+readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+state_dir_absent() { [ ! -e "${CASE_STATE}" ]; }
 
 # Runs a command every 0.1 s until it succeeds, at most N + 1 times (so for
 # at least N tenths of a second), and returns its last status.
@@ -270,32 +273,21 @@ poll_for() {
 # Start lines in the case's audit log, 0 if there is none.
 start_lines() {
   local n
-  n="$(grep -F -c -- 'started: launchd-run' \
-    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null)"
+  n="$(grep -F -c -- 'started: launchd-run' "${CASE_LOG}" 2>/dev/null)"
   echo "${n:-0}"
 }
 
 start_lines_reach() { [ "$(start_lines)" -ge "$1" ]; }
 
+file_not_empty() { [ -s "$1" ]; }
+pid_alive() { kill -0 "$1" 2>/dev/null; }
+pid_dead() { ! pid_alive "$1"; }
+
 # Polls (bash 3.2 has no wait -n) until a file exists, for up to ~5 s.
-wait_for_file() {
-  local i=0
-  while [ ! -s "$1" ] && [ "${i}" -lt 50 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ -s "$1" ]
-}
+wait_for_file() { poll_for 50 file_not_empty "$1"; }
 
 # Polls until a pid is gone, for up to ~3 s.
-pid_gone() {
-  local i=0
-  while kill -0 "$1" 2>/dev/null && [ "${i}" -lt 30 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  ! kill -0 "$1" 2>/dev/null
-}
+pid_gone() { poll_for 30 pid_dead "$1"; }
 
 # --- Cases. ------------------------------------------------------------------
 
@@ -577,27 +569,11 @@ test_crash_signals() {
 
 test_bad_counter_file() {
   local content
-  echo '# empty counter file'
-  new_case
-  seed_counter job ''
-  run_wrap job -- /usr/bin/true
-  check 'empty counter, ok: exit 0' rc_is 0
-  check 'empty counter, ok: counter removed' counter_absent job
-  check 'empty counter, ok: no banner' calls_are 0
-  check 'empty counter, ok: no error noise' err_empty
-
-  new_case
-  seed_counter job ''
-  run_wrap job -- /bin/sh -c 'exit 3'
-  check 'empty counter, fail: exit 3' rc_is 3
-  check 'empty counter, fail: counter restarts at 1' counter_is job 1
-  check 'empty counter, fail: no banner' calls_are 0
-  check 'empty counter, fail: no error noise' err_empty
-
-  # A word would read as an unset variable in $(( )), a bad number would fail
-  # the expansion, and 08 would be rejected as octal; all must read as 0.
-  echo '# garbage counter file'
-  for content in garbage 12abc 08 -1; do
+  # An empty file holds no number, a word would read as an unset variable in
+  # $(( )), a bad number would fail the expansion, and 08 would be rejected
+  # as octal; all must read as 0.
+  echo '# empty and garbage counter files'
+  for content in '' garbage 12abc 08 -1; do
     new_case
     seed_counter job "${content}"
     run_wrap job -- /usr/bin/true
@@ -611,6 +587,8 @@ test_bad_counter_file() {
     run_wrap job -- /bin/sh -c 'exit 3'
     check "counter '${content}', fail: job exit 3 passed through" rc_is 3
     check "counter '${content}', fail: counter reset to 1" counter_is job 1
+    check "counter '${content}', fail: below threshold, no banner" \
+      calls_are 0
     check "counter '${content}', fail: FAILED audit line written" \
       audit_has 'FAILED exit 3'
     check "counter '${content}', fail: no error noise" err_empty
@@ -645,8 +623,8 @@ test_bad_counter_file() {
   echo '# fail count that cannot be cleared'
   new_case
   seed_counter job 2
-  chmod a-w "${CASE_HOME}/.local/state/launchd-run/job"
-  if : 2>/dev/null >"${CASE_HOME}/.local/state/launchd-run/job/probe"; then
+  chmod a-w "${CASE_STATE}/job"
+  if : 2>/dev/null >"${CASE_STATE}/job/probe"; then
     # Root, or a filesystem (Windows) that ignores directory permissions.
     printf 'skip        %s\n' 'uncleared count: directory is still writable'
   else
@@ -658,7 +636,7 @@ test_bad_counter_file() {
       audit_has 's) - cannot clear'
     check 'uncleared count, ok: no error on the job stderr' err_empty
   fi
-  chmod u+w "${CASE_HOME}/.local/state/launchd-run/job"
+  chmod u+w "${CASE_STATE}/job"
 }
 
 #######################################
@@ -908,7 +886,6 @@ stop_took_ms_at_most() { [ "${STOP_MS}" -le "$1" ]; }
 wrapper_killed() { [ "${WRAPPER_KILLED}" -eq 1 ]; }
 wrapper_not_killed() { [ "${WRAPPER_KILLED}" -eq 0 ]; }
 stop_took_at_least() { [ "${STOP_SECONDS}" -ge "$1" ]; }
-pid_alive() { kill -0 "$1" 2>/dev/null; }
 
 # Polls for up to ~3 s until no process is left sleeping for exactly $1
 # seconds. Any that remain are queued for cleanup.
@@ -1132,41 +1109,24 @@ LR_WPID=''
 LR_LAUNCHER=''
 
 # Polls until a file exists and is not empty, for up to ~20 s.
-lr_stop_wait_for() {
-  local i=0
-  while [ ! -s "$1" ] && [ "${i}" -lt 200 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ -s "$1" ]
-}
+lr_stop_wait_for() { poll_for 200 file_not_empty "$1"; }
 
 # Lines in a file, 0 if it is missing.
-lr_stop_lines() {
-  if [ -f "$1" ]; then
-    wc -l <"$1" | tr -d ' '
-  else
-    echo 0
-  fi
-}
+lr_stop_lines() { file_lines "$1"; }
+
+# A file holds at least N lines.
+lr_stop_lines_reach() { [ "$(file_lines "$1")" -ge "$2" ]; }
 
 # Polls until a file holds at least N lines, for up to ~20 s.
-lr_stop_wait_lines() {
-  local i=0
-  while [ "$(lr_stop_lines "$1")" -lt "$2" ] && [ "${i}" -lt 200 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ "$(lr_stop_lines "$1")" -ge "$2" ]
-}
+lr_stop_wait_lines() { poll_for 200 lr_stop_lines_reach "$1" "$2"; }
 
-lr_stop_lines_are() { [ "$(lr_stop_lines "$1")" -eq "$2" ]; }
+lr_stop_lines_are() { [ "$(file_lines "$1")" -eq "$2" ]; }
 lr_stop_file_is() { [ "$(cat "$1" 2>/dev/null)" = "$2" ]; }
 lr_stop_not_killed() { [ "${KILLED_BY}" = 0 ]; }
 # The wrapper exited with this status rather than being killed by a signal.
-lr_stop_exited_with() { [ "${KILLED_BY}" = 0 ] && rc_is "$1"; }
+lr_stop_exited_with() { lr_stop_not_killed && rc_is "$1"; }
 lr_stop_source_lacks() { ! grep -F -q -- "$1" "${WRAPPER}"; }
-lr_stop_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+lr_stop_readme_has() { readme_has "$1"; }
 
 #######################################
 # Writes the case's job script (sh). It is run with one argument, the pid
@@ -1577,7 +1537,7 @@ lr_env_wrap() {
     *) cmd+=("HOME=${CASE_HOME}") ;;
   esac
   cmd+=("PATH=${LR_ENV_PATH:+${LR_ENV_PATH}:}${STUB_BIN}:${SYS_PATH}")
-  cmd+=("OSASCRIPT_CALLS=${CASE_DIR}/osascript.calls")
+  cmd+=("OSASCRIPT_CALLS=${CASE_CALLS}")
   if [ -n "${LR_ENV_VERSION}" ]; then
     cmd+=("REPO_VERSION=${LR_ENV_VERSION}")
   fi
@@ -1627,9 +1587,7 @@ lr_env_job_saw() {
 }
 
 # Lines on the wrapper's stderr.
-lr_env_err_lines_are() {
-  [ "$(wc -l <"${CASE_DIR}/err" | tr -d ' ')" -eq "$1" ]
-}
+lr_env_err_lines_are() { [ "$(file_lines "${CASE_DIR}/err")" -eq "$1" ]; }
 
 # The wrapper's stderr holds exactly one line, and it is not bash's own
 # complaint about an unset variable.
@@ -1643,12 +1601,12 @@ lr_env_ran_with() { [ -e "$1" ] && rc_is "$2"; }
 # Two start lines, the first not empty, are the same.
 lr_env_same_start() { [ -n "$1" ] && [ "$1" = "$2" ]; }
 
-lr_env_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+lr_env_readme_has() { readme_has "$1"; }
 
 # The first audit line with its timestamp and label cut off.
 lr_env_start_line() {
   sed -n '1s/^.*started: /started: /p' \
-    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
+    "${CASE_LOG}" 2>/dev/null
 }
 
 # Issue #23: a variable the caller set under a name the wrapper also uses
@@ -1860,7 +1818,7 @@ test_lr_env_30() {
 # --- lr-count: issues #45, #46, #48. -----------------------------------------
 
 # No audit log was written.
-lr_count_no_audit() { [ ! -e "${CASE_HOME}/Library/Logs/launchd-run.log" ]; }
+lr_count_no_audit() { path_absent "${CASE_LOG}"; }
 
 # One line of the wrapper's stderr contains both fixed strings.
 lr_count_err_line_has() {
@@ -1880,7 +1838,7 @@ lr_count_err_line_has() {
 # Exactly N osascript calls contain the fixed string.
 lr_count_calls_with() {
   local n
-  n="$(grep -F -c -- "$1" "${CASE_DIR}/osascript.calls" 2>/dev/null)"
+  n="$(grep -F -c -- "$1" "${CASE_CALLS}" 2>/dev/null)"
   [ "${n:-0}" -eq "$2" ]
 }
 
@@ -1889,7 +1847,7 @@ lr_count_calls_with() {
 lr_count_reset_noted() {
   local lines
   lines="$(grep -F -- 's) - cannot clear' \
-    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null)"
+    "${CASE_LOG}" 2>/dev/null)"
   [ -n "${lines}" ] || return 1
   grep -E -i -q 'reset[^0-9]*0([^0-9]|$)' <<<"${lines}"
 }
@@ -2017,7 +1975,7 @@ test_lr_count_48() {
   echo '# lr-count #48: an unremovable fail count is reset to 0'
   new_case
   seed_counter job 5
-  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  dir="${CASE_STATE}/job"
   chmod a-w "${dir}"
   if : 2>/dev/null >"${dir}/probe"; then
     printf 'skip        %s\n' 'lr-count: #48 directory is still writable'
@@ -2051,7 +2009,7 @@ test_lr_count_48() {
 
   new_case
   seed_counter job 1
-  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  dir="${CASE_STATE}/job"
   chmod a-w "${dir}"
   if : 2>/dev/null >"${dir}/probe"; then
     printf 'skip        %s\n' 'lr-count: #48 directory is still writable'
@@ -2066,7 +2024,7 @@ test_lr_count_48() {
   echo '# lr-count #48: a counter that can be neither removed nor written'
   new_case
   seed_counter job 5
-  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  dir="${CASE_STATE}/job"
   chmod a-w "${dir}/fail-count" "${dir}"
   if : 2>/dev/null >>"${dir}/fail-count"; then
     printf 'skip        %s\n' 'lr-count: #48 counter is still writable'
