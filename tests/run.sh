@@ -255,6 +255,28 @@ out_is() { [ "$(cat "${CASE_DIR}/out")" = "$1" ]; }
 path_absent() { [ ! -e "$1" ]; }
 state_dir_absent() { [ ! -e "${CASE_HOME}/.local/state/launchd-run" ]; }
 
+# Runs a command every 0.1 s until it succeeds, at most N + 1 times (so for
+# at least N tenths of a second), and returns its last status.
+poll_for() {
+  local tries="$1" i=0
+  shift
+  until "$@"; do
+    [ "${i}" -lt "${tries}" ] || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+
+# Start lines in the case's audit log, 0 if there is none.
+start_lines() {
+  local n
+  n="$(grep -F -c -- 'started: launchd-run' \
+    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null)"
+  echo "${n:-0}"
+}
+
+start_lines_reach() { [ "$(start_lines)" -ge "$1" ]; }
+
 # Polls (bash 3.2 has no wait -n) until a file exists, for up to ~5 s.
 wait_for_file() {
   local i=0
@@ -492,7 +514,7 @@ test_stop_signals() {
   new_case
   seed_counter svc 2
   if ! stop_wrapper_with TERM \
-    "trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & wait \$!"; then
+    "trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & ready; wait \$!"; then
     check 'stop at threshold: wrapper started the job' false
   else
     check 'stop at threshold: streak of 2 preserved' counter_is svc 2
@@ -640,23 +662,34 @@ test_bad_counter_file() {
 }
 
 #######################################
-# Starts the wrapper in the background around a job that records its own
-# pid, then sends the wrapper the given signal once the job is up. This is
-# what launchctl kill, bootout, logout and a KeepAlive restart do: the
-# signal lands on the wrapper, not on the job.
+# Starts the wrapper in the background around a job, then sends the wrapper
+# the given signal once both are ready, with no fixed sleep: the wrapper has
+# written its start line, which it does only after its stop traps are set,
+# and the job has said it is ready, once its own traps are set. This is what
+# launchctl kill, bootout, logout and a KeepAlive restart do: the signal
+# lands on the wrapper, not on the job.
 # Globals:
 #   RC (set to the wrapper's exit status)
 #   CHILD (set to the job's pid, or empty if the job never started)
 # Arguments:
-#   Signal name, then the body of the job script (sh; $1 is the pid file).
+#   Signal name, then the body of the job script (sh). The body calls the
+#   script's "ready" function, which writes the job's pid to the pid file
+#   $1, once it is ready to be signalled.
+# Returns:
+#   1 (signalling nothing) if the job or the start line is not there within
+#   about 5 s.
 #######################################
 stop_wrapper_with() {
-  local sig="$1" body="$2" job pidfile wpid
+  local sig="$1" body="$2" job pidfile wpid starts
   job="${CASE_DIR}/job.sh"
   pidfile="${CASE_DIR}/child.pid"
   # shellcheck disable=SC2016  # Expanded by the job script, not here.
-  printf '#!/bin/sh\necho $$ >"$1"\n%s\n' "${body}" >"${job}"
+  printf '%s\n' '#!/bin/sh' 'pf="$1"' 'ready() { echo $$ >"${pf}"; }' \
+    "${body}" >"${job}"
   chmod +x "${job}"
+  # A case may stop the wrapper more than once: this run's start line is the
+  # one past those already in the log.
+  starts=$(($(start_lines) + 1))
 
   # env execs the wrapper, so $! is the wrapper's own bash. SIGINT is not
   # tested: a non-interactive shell starts async jobs with SIGINT ignored,
@@ -674,8 +707,14 @@ stop_wrapper_with() {
   fi
   CHILD="$(cat "${pidfile}")"
   leftover_pids="${leftover_pids} ${CHILD}"
-  # The job is up; give the wrapper a moment to reach its wait.
-  sleep 0.2
+  # The wrapper writes its start line once its stop traps are set and before
+  # it forks the job, so here it is normally there already. Waiting on it
+  # keeps the signal from going out early to a copy that writes it later.
+  if ! poll_for 50 start_lines_reach "${starts}"; then
+    kill -KILL "${wpid}" 2>/dev/null
+    { wait "${wpid}"; } 2>/dev/null
+    return 1
+  fi
 
   kill "-${sig}" "${wpid}"
   # The braces keep bash's "Terminated" job report out of the test output.
@@ -689,7 +728,7 @@ test_signal_to_wrapper() {
   for sig in TERM HUP; do
     new_case
     seed_counter svc 1
-    if ! stop_wrapper_with "${sig}" 'exec /bin/sleep 30'; then
+    if ! stop_wrapper_with "${sig}" 'ready; exec /bin/sleep 30'; then
       check "SIG${sig} to wrapper: wrapper started the job" false
       continue
     fi
@@ -709,7 +748,7 @@ test_signal_to_wrapper() {
   # sleep runs in the background so sh can act on the trap at once, and the
   # trap takes it down so the suite leaves nothing behind.
   if ! stop_wrapper_with TERM \
-    "trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & wait \$!"; then
+    "trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & ready; wait \$!"; then
     check 'clean stop: wrapper started the job' false
     return
   fi
@@ -728,7 +767,7 @@ test_stop_classified_by_wrapper() {
   echo '# #21: wrapper signalled, job exits 1 on SIGTERM: a stop, not counted'
   new_case
   seed_counter svc 1
-  body="trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & wait \$!"
+  body="trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & ready; wait \$!"
   if ! stop_wrapper_with TERM "${body}"; then
     check '#21 exit 1 on stop: wrapper started the job' false
   else
@@ -750,7 +789,7 @@ test_stop_classified_by_wrapper() {
   echo '# #21: wrapper signalled, job exits 0 on SIGTERM: streak kept'
   new_case
   seed_counter svc 5
-  body="trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & wait \$!"
+  body="trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & ready; wait \$!"
   if ! stop_wrapper_with TERM "${body}"; then
     check '#21 exit 0 on stop: wrapper started the job' false
     return
