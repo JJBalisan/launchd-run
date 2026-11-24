@@ -42,9 +42,9 @@ launchd_run_job_env=(/usr/bin/env --
   ${launchd_run_job_env+"launchd_run_job_env=${launchd_run_job_env}"}
   ${launchd_run_name+"launchd_run_name=${launchd_run_name}"})
 for launchd_run_name in REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES \
-  AUDIT_KEEP_LINES alert_after kill_after state fails_file prev fails started \
-  pid stopped code elapsed sig killed woke deadline_done stop_pid told \
-  next_wait; do
+  AUDIT_KEEP_LINES AUDIT_WARNED alert_after kill_after state fails_file prev \
+  fails started pid stopped code elapsed sig killed woke deadline_done \
+  stop_pid told next_wait; do
   if [[ -n "${!launchd_run_name+x}" ]]; then
     launchd_run_job_env+=("${launchd_run_name}=${!launchd_run_name}")
   fi
@@ -72,6 +72,7 @@ readonly AUDIT_KEEP_LINES=100000
 # Set once the arguments are parsed; read by note() and notify().
 LABEL=''
 AUDIT=''
+AUDIT_WARNED=''
 
 #######################################
 # Replaces the calling process with the job, in the caller's environment.
@@ -103,16 +104,26 @@ usage_error() {
 }
 
 #######################################
-# Appends one timestamped line to the central audit log.
+# Appends one timestamped line to the central audit log. A log that cannot
+# be written is reported once per run, as one line of the wrapper's own on
+# stderr (which launchd sends to the job's StandardErrorPath), never as
+# bash's own error for each line.
 # Globals:
 #   LABEL
 #   AUDIT
+#   AUDIT_WARNED (set once the failure has been reported)
 # Arguments:
 #   Message words, joined with spaces.
 #######################################
 note() {
-  printf '%s  %-38s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${LABEL}" "$*" \
-    >>"${AUDIT}"
+  if ! { printf '%s  %-38s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "${LABEL}" "$*" >>"${AUDIT}"; } 2>/dev/null \
+    && [[ -z "${AUDIT_WARNED}" ]]; then
+    AUDIT_WARNED=1
+    echo "launchd-run: cannot write the audit log ${AUDIT};" \
+      'this run is not logged' >&2
+  fi
+  return 0
 }
 
 #######################################
@@ -120,7 +131,8 @@ note() {
 # past AUDIT_MAX_BYTES. The trimmed copy is written beside the log and renamed
 # over it, so a reader never sees a torn file; a line another job appends
 # during the rename can be lost, which is accepted. The trim is noted in the
-# log so the gap is explained.
+# log so the gap is explained, and so is a trim that fails (a Logs directory
+# that cannot be written to): its errors stay off the job's stderr.
 # Globals:
 #   AUDIT
 #######################################
@@ -129,11 +141,12 @@ rotate_audit() {
   size="$(/usr/bin/stat -f%z "${AUDIT}" 2>/dev/null)" || return 0
   ((size > AUDIT_MAX_BYTES)) || return 0
   tmp="${AUDIT}.$$"
-  if tail -n "${AUDIT_KEEP_LINES}" "${AUDIT}" >"${tmp}" \
-    && /bin/mv -f "${tmp}" "${AUDIT}"; then
+  if { tail -n "${AUDIT_KEEP_LINES}" "${AUDIT}" >"${tmp}" \
+    && /bin/mv -f "${tmp}" "${AUDIT}"; } 2>/dev/null; then
     note "audit log trimmed to the last ${AUDIT_KEEP_LINES} lines"
   else
-    rm -f "${tmp}"
+    rm -f "${tmp}" 2>/dev/null
+    note "audit log past ${AUDIT_MAX_BYTES} bytes and cannot be trimmed"
   fi
 }
 
@@ -342,9 +355,11 @@ main() {
   state="${HOME}/.local/state/launchd-run/${LABEL}"
   AUDIT="${HOME}/Library/Logs/launchd-run.log"
   readonly AUDIT
-  # A state directory that cannot be made is reported where the counter is
-  # written, in the audit log, not on the job's stderr.
-  mkdir -p "${state}" 2>/dev/null
+  # A home need not have ~/Library/Logs (a fresh account, a HOME that is not
+  # a macOS home), so it is made like the state directory. One that cannot
+  # be made is reported by note(); a state directory that cannot be made is
+  # reported where the counter is written, in the audit log.
+  mkdir -p "${state}" "${AUDIT%/*}" 2>/dev/null
   rotate_audit
 
   # One start line per run, naming the wrapper's own checkout, so an audit

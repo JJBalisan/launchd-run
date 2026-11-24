@@ -17,7 +17,11 @@ must not contain `/` or start with `.`; anything else is a usage error
 `~/Library/Logs/launchd-run.log`: every run writes a start line,
 `started: launchd-run <version>`, naming the wrapper's own checkout (see
 "Releasing"), then an outcome line; per-job counters in
-`~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
+`~/.local/state/launchd-run/<label>/`. Both directories are made if they are
+missing. When the audit log cannot be written, the wrapper says so once per
+run on stderr (`launchd-run: cannot write the audit log ...`), which launchd
+sends to the job's `StandardErrorPath`; the job itself is run and counted as
+usual. A counter file that does not hold a
 plain decimal number of at most 9 digits reads as 0, so a corrupt one restarts
 the streak rather than breaking the wrapper. A counter that cannot be written
 at all (say, a root-owned `~/.local/state`) raises a banner on every failure
@@ -120,6 +124,27 @@ SIGKILL), leaving the command running as an orphan with only the start line
 logged. A stop that lands before the traps are installed, while the wrapper
 is still starting up, kills the wrapper before it has started the command.
 
+A stop that comes a millisecond or so after the command has died of a signal
+the wrapper does not trap (SIGKILL, or a crash such as SIGSEGV) can hang or
+crash the wrapper under `/bin/bash` 3.2
+([#52](https://github.com/JJBalisan/launchd-run/issues/52)). This is bash's
+own doing, not the wrapper's, and no script can prevent it while it waits
+with the `wait` builtin. As bash 3.2's `wait` reaps such a command it prints
+its own report of it ("Killed: 9", which the wrapper discards), and the signal
+handler of a trapped signal that arrives meanwhile jumps straight out of the
+`wait`, leaving the lock on stderr or the one-time set-up of `strsignal()`
+taken. The wrapper then hangs in its next command substitution, or aborts
+("BUG IN CLIENT OF LIBPLATFORM: Trying to recursively lock an os_once_t"),
+with only the start line logged. The same jump can also lose the command's
+status, which is then logged as `exit -1` (the wrapper exits 255). A short
+script with one trap, a background command, two `wait`s and a command
+substitution, and no wrapper code, hung or crashed in 9 of 200 such runs
+under `/bin/bash` 3.2 and in none of 200 under bash 5.3. When the command
+dies of SIGTERM instead, which the wrapper traps, bash prints no report and
+none of the runs hung or crashed. Under launchd a hung wrapper is ended by
+the SIGKILL that follows `ExitTimeOut`; a stop sent by hand is not followed
+by one.
+
 Other signals sent to the wrapper do not end it either:
 
 - SIGUSR1, SIGUSR2 and SIGALRM are passed on to the command as themselves, and
@@ -189,7 +214,9 @@ of 84 bytes a line and 270 lines a day, measured on a live log in November
 2026) it keeps the last 100,000 lines, about a year: the trimmed copy is
 written beside the log and renamed over it, and the trim is noted in the log.
 A line another job appends during that rename can be lost, which is accepted
-for an audit trail of this kind. Nothing in `/etc/newsyslog.d` is needed.
+for an audit trail of this kind. A trim that fails (a `~/Library/Logs` the
+wrapper cannot write to) is noted in the log and tried again on the next run.
+Nothing in `/etc/newsyslog.d` is needed.
 
 ## Releasing
 
