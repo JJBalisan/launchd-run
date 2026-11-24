@@ -11,7 +11,10 @@
 # Under launchd the wrapper is the job's main process, so a stop (launchctl
 # kill, bootout, logout, a KeepAlive restart) signals the wrapper, not the
 # command. SIGHUP, SIGINT and SIGTERM are therefore forwarded to the command
-# as SIGTERM, and the stop is logged once the command has exited.
+# as SIGTERM, and the stop is logged once the command has exited, however many
+# more arrive meanwhile. SIGUSR1, SIGUSR2 and SIGALRM are forwarded as
+# themselves, and SIGPIPE and SIGQUIT are ignored: none of them ends the
+# wrapper and orphans the command. SIGSTOP cannot be trapped.
 #
 # launchd's SIGKILL, ExitTimeOut seconds after its SIGTERM, also lands on the
 # wrapper alone and cannot be trapped: a command that ignores SIGTERM would
@@ -25,6 +28,28 @@
 # a single working script.
 
 set -uo pipefail
+
+# The job gets the environment the wrapper was started with. The wrapper
+# assigns many names of its own, and one the caller also exported would reach
+# the job with the wrapper's value, so the caller's values of them are taken
+# here, before the first assignment, and put back by exec_job. Only names the
+# caller set are put back: an unset one stays unset. Keep the list in step
+# with every global and every local of main (tests/lr_env_s3_boundary.sh
+# checks). The two names used to do this are put back too, read before they
+# are first assigned.
+# shellcheck disable=SC2128  # Read as the caller's scalar, before the array.
+launchd_run_job_env=(/usr/bin/env --
+  ${launchd_run_job_env+"launchd_run_job_env=${launchd_run_job_env}"}
+  ${launchd_run_name+"launchd_run_name=${launchd_run_name}"})
+for launchd_run_name in REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES \
+  AUDIT_KEEP_LINES alert_after kill_after state fails_file prev fails started \
+  pid stopped code elapsed sig killed woke deadline_done stop_pid told \
+  next_wait; do
+  if [[ -n "${!launchd_run_name+x}" ]]; then
+    launchd_run_job_env+=("${launchd_run_name}=${!launchd_run_name}")
+  fi
+done
+unset launchd_run_name
 
 # Names the checkout this run comes from, resolved through the installed
 # symlink; "unknown" if the wrapper was copied out of the repo. Sourced
@@ -45,6 +70,23 @@ readonly AUDIT_KEEP_LINES=5000
 # Set once the arguments are parsed; read by note() and notify().
 LABEL=''
 AUDIT=''
+
+#######################################
+# Replaces the calling process with the job, in the caller's environment.
+# The program is found on PATH by env, never among the wrapper's functions.
+# env reads any argument with an "=" as an assignment, so such a command
+# goes through a bash that execs it instead.
+# Globals:
+#   launchd_run_job_env
+# Arguments:
+#   The command and its arguments.
+#######################################
+exec_job() {
+  if [[ "$1" == *=* ]]; then
+    exec "${launchd_run_job_env[@]}" /bin/bash -c 'exec "$@"' launchd-run "$@"
+  fi
+  exec "${launchd_run_job_env[@]}" "$@"
+}
 
 #######################################
 # Reports a malformed command line on stderr and exits with EX_USAGE.
@@ -117,6 +159,51 @@ notify() {
 }
 
 #######################################
+# Sends a signal to the job, if it has been started. Called from the traps.
+# Globals:
+#   pid (main's, empty until the job is forked)
+# Arguments:
+#   The signal name.
+#######################################
+# shellcheck disable=SC2329 # invoked from the traps in main
+forward_signal() {
+  [[ -n "${pid}" ]] && kill -s "$1" "${pid}" 2>/dev/null
+  return 0
+}
+
+#######################################
+# Records a stop and forwards it to the job as SIGTERM, if the job has been
+# started. Called from the traps.
+# Globals:
+#   stopped, stop_pid, told, next_wait (main's, set); pid (main's, read)
+# Arguments:
+#   The signal number.
+#######################################
+# shellcheck disable=SC2329 # invoked from the traps in main
+on_stop() {
+  # $! names the job only once it has been forked, so it tells which side of
+  # the fork the first stop reached the wrapper on.
+  if [[ -z "${stopped}" ]]; then
+    # Until a job has been forked, bash 3.2 rejects $! under set -u even
+    # with a default.
+    set +u
+    stop_pid="$!"
+    set -u
+  fi
+  stopped="$1"
+  # bash runs a trap between commands. One that runs as the wrapper is about
+  # to wait, after its loop has looked for a stop, would not cut that wait
+  # short; pointing it at the wrapper's own pid, which is not a child, makes
+  # it return at once, and the loop looks again.
+  next_wait="$$"
+  if [[ -n "${pid}" ]]; then
+    kill -s TERM "${pid}" 2>/dev/null
+    told=1
+  fi
+  return 0
+}
+
+#######################################
 # Enforces --kill-after on a job that has been sent SIGTERM: returns once the
 # job has exited, or sends it SIGKILL when the deadline passes first. The
 # deadline is read off SECONDS, bash's clock, not counted in polls, so it
@@ -142,9 +229,10 @@ kill_at_deadline() {
   SECONDS=0
   while kill -0 "${job}"; do
     if ((SECONDS >= deadline)); then
-      # From here no stop may interrupt the reap: a stop that lands just
-      # after a job dies of a signal has hung bash 3.2 (issue #52).
-      trap '' HUP INT TERM
+      # From here no trapped signal may interrupt the reap: one that lands
+      # just after a job dies of a signal has hung bash 3.2 (issue #52). The
+      # job is being killed, so there is nothing left to forward.
+      trap '' HUP INT TERM USR1 USR2 ALRM
       kill -KILL "${job}" || return 1
       return 0
     fi
@@ -166,11 +254,11 @@ kill_at_deadline() {
 #######################################
 main() {
   local alert_after=2 kill_after=''
-  local state fails_file prev fails started pid stopped='' code elapsed sig
-  local killed=''
+  local state fails_file prev fails started pid='' stopped='' code elapsed sig
+  local killed='' woke='' deadline_done='' stop_pid='' told='' next_wait=''
 
   LABEL="${1:-}"
-  shift || true
+  shift
   if [[ -z "${LABEL}" ]]; then
     usage_error 'no label given'
   fi
@@ -212,6 +300,33 @@ main() {
     usage_error 'no command given'
   fi
 
+  # Without a HOME there is nowhere to keep the audit log or the counter (a
+  # LaunchDaemon without UserName has none), so the job runs as it is: no
+  # bookkeeping, no banner, and the wrapper's status is the job's. An empty
+  # HOME counts as none.
+  if [[ -z "${HOME:-}" ]]; then
+    echo 'launchd-run: HOME is not set; running the job without bookkeeping' >&2
+    exec_job "$@"
+  fi
+
+  # The stop traps go in before the job, or any command of main's, is
+  # forked, so that a stop at any later point is recorded and never takes its
+  # default action, which would kill the wrapper and orphan the job. They
+  # hold the signal number for the exit status of a stop before the job has
+  # started, and set woke so that a wait they interrupt is told from one that
+  # ended with the job.
+  trap 'woke=1; on_stop 1' HUP
+  trap 'woke=1; on_stop 2' INT
+  trap 'woke=1; on_stop 15' TERM
+  trap 'woke=1; forward_signal USR1' USR1
+  trap 'woke=1; forward_signal USR2' USR2
+  trap 'woke=1; forward_signal ALRM' ALRM
+  # A handler, not an ignore, until the job is forked: an ignored signal is
+  # inherited, and the job must keep SIGPIPE's default.
+  trap ':' PIPE
+  # The job starts with SIGQUIT ignored in any case (see below).
+  trap '' QUIT
+
   state="${HOME}/.local/state/launchd-run/${LABEL}"
   AUDIT="${HOME}/Library/Logs/launchd-run.log"
   readonly AUDIT
@@ -233,34 +348,75 @@ main() {
   # ignored, and the job inherits that. launchd stops a job with SIGTERM and
   # then, once ExitTimeOut has passed, SIGKILL; the SIGKILL hits the wrapper
   # alone and cannot be trapped, which is what --kill-after is for.
-  "$@" <&0 &
+  #
+  # The job is exec'd from a subshell rather than run as a plain background
+  # command. The forked process inherits a copy of stopped, so a stop the
+  # wrapper has recorded by the fork means the job is never run. And the
+  # subshell resets the wrapper's traps before the exec: under bash 3.2 a
+  # background command would still hold them while it looks the command up,
+  # and a SIGTERM forwarded then would be caught and lost at the exec. One
+  # caught in the instant before the reset is sent again by bash to the
+  # subshell, now with its default action (bash prints two warnings about
+  # it), so a stop forwarded at any point ends the job, before or after it
+  # has exec'd.
+  (
+    [[ -z "${stopped}" ]] || exit "$((128 + stopped))"
+    exec_job "$@"
+  ) <&0 &
   pid=$!
-  trap 'stopped=1; kill -TERM "${pid}" 2>/dev/null' HUP INT TERM
-  # The braces keep bash's own "Segmentation fault ..." report of a crashed
-  # job off the job's stderr.
-  { wait "${pid}"; } 2>/dev/null
-  code=$?
+  trap '' PIPE
   if [[ -n "${stopped}" ]]; then
-    # The trap interrupted wait with 128+signal before the job had exited.
-    # Wait for the job itself and take its status whatever it is: a job that
-    # handles SIGTERM and exits 0 has stopped cleanly.
-    #
-    # With --kill-after, a job that ignores the forwarded SIGTERM is not
-    # waited for indefinitely: it is killed at the deadline, so that the wait
-    # reaps it and the stop is logged before launchd's SIGKILL is due. The
-    # kill and the wait share one redirect, so bash's "Killed" report of the
-    # job cannot reach the job's stderr between the two.
-    {
-      if [[ -n "${kill_after}" ]] \
-        && kill_at_deadline "${pid}" "${kill_after}"; then
-        killed=1
-      fi
-      wait "${pid}"
-    } 2>/dev/null
-    code=$?
+    if [[ "${stop_pid}" != "${pid}" ]]; then
+      # The first stop came before the fork: the subshell saw it and exits
+      # without running the job.
+      trap '' HUP INT TERM USR1 USR2 ALRM
+      wait "${pid}" 2>/dev/null
+      note "stopped by signal before the job started - not counted"
+      exit $((128 + stopped))
+    fi
+    # It came after the fork but before the pid was known, so no SIGTERM has
+    # been forwarded yet. The job gets it now.
+    if [[ -z "${told}" ]]; then
+      kill -TERM "${pid}" 2>/dev/null
+    fi
   fi
+  # A trapped signal interrupts wait with 128+signal while the job is still
+  # running, so the job is waited for again until it has gone, and the wait
+  # that reaps it has the last word on its status. With --kill-after a job
+  # that ignores the forwarded SIGTERM is killed at the deadline instead of
+  # being waited for indefinitely, so that the stop is logged before launchd's
+  # SIGKILL is due. The braces keep bash's own "Segmentation fault ..." and
+  # "Killed" reports of the job off the job's stderr.
+  {
+    while :; do
+      # Reset before the stop is looked for, so that a stop whose trap runs
+      # after this point leaves next_wait at $$ (see on_stop), and woke set.
+      woke=''
+      next_wait="${pid}"
+      if [[ -n "${stopped}" && -n "${kill_after}" && -z "${deadline_done}" ]] \
+        && kill -0 "${pid}"; then
+        deadline_done=1
+        if kill_at_deadline "${pid}" "${kill_after}"; then
+          killed=1
+        fi
+      fi
+      wait "${next_wait}"
+      code=$?
+      [[ -n "${woke}" ]] || break
+      kill -0 "${pid}" && continue
+      # A signal came in and the job is gone: the wait returned its status,
+      # 127 for the wrapper's own pid, or 128+signal with the job reaped in
+      # the background meanwhile. Outside posix mode bash keeps a reaped
+      # job's status, so a second wait returns it in every case, a status of
+      # 127 included. (POSIXLY_CORRECT in the environment would put the
+      # wrapper in posix mode, and this wait would then give 127.)
+      wait "${pid}"
+      code=$?
+      break
+    done
+  } 2>/dev/null
   # The job is done; a further stop must not cut the bookkeeping short.
-  trap '' HUP INT TERM
+  trap '' HUP INT TERM USR1 USR2 ALRM
   elapsed=$(($(date +%s) - started))
 
   # Anything but a plain decimal (so no leading zero, which $(( )) would read

@@ -1062,6 +1062,746 @@ test_log_rotation() {
   check 'no rotation: nothing about a trim' audit_lacks 'trimmed'
 }
 
+# --- lr-stop: issues #27, #37, #25 and #41. ---------------------------------
+# A check described "lr-stop:" fails on the wrapper these issues were filed
+# against; one described "lr-stop-guard:" passes on it and must keep passing.
+
+# Read by lr_stop_start: a directory to put first on PATH, and the command
+# (and, if not empty, the first argument) that the gate stub there holds.
+LR_PATH_PREFIX=''
+LR_GATE_CMD=''
+LR_GATE_ARG=''
+# Set by lr_stop_start.
+LR_WPID=''
+LR_LAUNCHER=''
+
+# Polls until a file exists and is not empty, for up to ~20 s.
+lr_stop_wait_for() {
+  local i=0
+  while [ ! -s "$1" ] && [ "${i}" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -s "$1" ]
+}
+
+# Lines in a file, 0 if it is missing.
+lr_stop_lines() {
+  if [ -f "$1" ]; then
+    wc -l <"$1" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+# Polls until a file holds at least N lines, for up to ~20 s.
+lr_stop_wait_lines() {
+  local i=0
+  while [ "$(lr_stop_lines "$1")" -lt "$2" ] && [ "${i}" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(lr_stop_lines "$1")" -ge "$2" ]
+}
+
+lr_stop_lines_are() { [ "$(lr_stop_lines "$1")" -eq "$2" ]; }
+lr_stop_file_is() { [ "$(cat "$1" 2>/dev/null)" = "$2" ]; }
+lr_stop_not_killed() { [ "${KILLED_BY}" = 0 ]; }
+# The wrapper exited with this status rather than being killed by a signal.
+lr_stop_exited_with() { [ "${KILLED_BY}" = 0 ] && rc_is "$1"; }
+lr_stop_source_lacks() { ! grep -F -q -- "$1" "${WRAPPER}"; }
+lr_stop_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+
+#######################################
+# Writes the case's job script (sh). It is run with one argument, the pid
+# file $CASE_DIR/child.pid, and writes its pid there once its traps are set.
+# Arguments:
+#   The body of the script.
+#######################################
+lr_stop_job() {
+  printf '#!/bin/sh\n%s\n' "$1" >"${CASE_DIR}/job.sh"
+  chmod +x "${CASE_DIR}/job.sh"
+}
+
+#######################################
+# Puts a gate in front of a command the wrapper runs before it forks the job.
+# The first call of it (with the given first argument, if one is given)
+# writes $CASE_DIR/ready and holds until $CASE_DIR/go exists (~20 s at most),
+# then runs the real command, so a signal sent while it holds reaches the
+# wrapper at a known point.
+# Globals:
+#   LR_PATH_PREFIX, LR_GATE_CMD, LR_GATE_ARG (set)
+# Arguments:
+#   The command (one that lives in /bin), then its first argument or ''.
+#######################################
+lr_stop_gate() {
+  local dir="${CASE_DIR}/gate"
+  mkdir -p "${dir}"
+  # shellcheck disable=SC2016  # Expanded by the gate, not here.
+  printf '%s\n' '#!/bin/bash' \
+    'n="${0##*/}" g="${LR_G_DIR}"' \
+    'if [ "${n}" = "${LR_G_CMD}" ] && [ ! -e "${g}/ready" ]; then' \
+    '  if [ -n "${LR_G_ARG}" ] && [ "${1:-}" != "${LR_G_ARG}" ]; then' \
+    '    exec "/bin/${n}" "$@"' \
+    '  fi' \
+    '  echo held >"${g}/ready"' \
+    '  i=0' \
+    '  while [ ! -e "${g}/go" ] && [ "${i}" -lt 200 ]; do' \
+    '    /bin/sleep 0.1' \
+    '    i=$((i + 1))' \
+    '  done' \
+    'fi' \
+    'exec "/bin/${n}" "$@"' >"${dir}/$1"
+  chmod +x "${dir}/$1"
+  LR_PATH_PREFIX="${dir}"
+  LR_GATE_CMD="$1"
+  LR_GATE_ARG="$2"
+}
+
+#######################################
+# Starts the wrapper in the background the way launchd does: with SIGINT and
+# SIGQUIT at their defaults (a shell starts its background jobs with both
+# ignored) and SIGPIPE too (a CI runner can start the suite with it ignored,
+# which no shell can undo). It goes through a perl launcher that writes the
+# wrapper's pid to $CASE_DIR/wrapper.pid and, once it ends, the signal that
+# killed it (0 for none) to $CASE_DIR/killed-by.
+# Globals:
+#   LR_LAUNCHER (set to the launcher's pid)
+#   LR_WPID (set to the wrapper's pid, or empty if it never started)
+#   LR_PATH_PREFIX, LR_GATE_CMD, LR_GATE_ARG (read)
+# Arguments:
+#   Arguments for launchd-run.sh.
+#######################################
+lr_stop_start() {
+  /bin/rm -f "${CASE_DIR}/wrapper.pid" "${CASE_DIR}/killed-by"
+  # shellcheck disable=SC2016  # $SIG, $p, $s and the rest belong to perl.
+  env HOME="${CASE_HOME}" \
+    PATH="${LR_PATH_PREFIX:+${LR_PATH_PREFIX}:}${STUB_BIN}:${SYS_PATH}" \
+    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
+    REPO_VERSION="${TEST_VERSION}" LR_G_DIR="${CASE_DIR}" \
+    LR_G_CMD="${LR_GATE_CMD}" LR_G_ARG="${LR_GATE_ARG}" \
+    /usr/bin/perl -e '$SIG{INT} = $SIG{QUIT} = $SIG{PIPE} = "DEFAULT";
+      my ($pf, $kf) = splice(@ARGV, 0, 2);
+      my $p = fork();
+      defined($p) or die;
+      if ($p == 0) { exec { $ARGV[0] } @ARGV; exit 127; }
+      open(my $h, ">", "$pf.new") or die;
+      print $h "$p\n";
+      close($h);
+      rename("$pf.new", $pf) or die;
+      waitpid($p, 0);
+      my $s = $?;
+      open($h, ">", $kf) or die;
+      print $h ($s & 127);
+      close($h);
+      exit(($s & 127) ? 128 + ($s & 127) : $s >> 8)' \
+    "${CASE_DIR}/wrapper.pid" "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
+    >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
+  LR_LAUNCHER=$!
+  LR_WPID=''
+  if lr_stop_wait_for "${CASE_DIR}/wrapper.pid"; then
+    LR_WPID="$(cat "${CASE_DIR}/wrapper.pid")"
+  fi
+}
+
+#######################################
+# Waits for the wrapper lr_stop_start began, SIGKILLing it if it is still
+# there after the given number of seconds.
+# Globals:
+#   RC (set to the wrapper's exit status, or 128+N when killed by signal N)
+#   KILLED_BY (set to the signal number that killed the wrapper, or 0)
+# Arguments:
+#   The limit in seconds.
+#######################################
+lr_stop_finish() {
+  local limit="$1" t0="${SECONDS}"
+  while kill -0 "${LR_LAUNCHER}" 2>/dev/null; do
+    if ((SECONDS - t0 >= limit)); then
+      if [ -n "${LR_WPID}" ]; then
+        kill -KILL "${LR_WPID}" 2>/dev/null
+      fi
+      break
+    fi
+    sleep 0.1
+  done
+  wait "${LR_LAUNCHER}" 2>/dev/null
+  RC=$?
+  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+}
+
+# Kills the case's job if it is still running (the unfixed wrapper orphans
+# it) and queues it for the suite's cleanup too.
+lr_stop_reap() {
+  local child
+  child="$(cat "${CASE_DIR}/child.pid" 2>/dev/null)"
+  if [ -n "${child}" ]; then
+    kill -KILL "${child}" 2>/dev/null
+    leftover_pids="${leftover_pids} ${child}"
+  fi
+}
+
+# Starts the case's job under the wrapper and waits until it is up, then
+# gives the wrapper a moment to reach its wait, as launchd_stop does.
+lr_stop_start_job() {
+  lr_stop_start svc "$@" -- "${CASE_DIR}/job.sh" "${CASE_DIR}/child.pid"
+  lr_stop_wait_for "${CASE_DIR}/child.pid" || return 1
+  sleep 1
+}
+
+# Issue #27: a stop that lands after the arguments are parsed but before the
+# job is forked is not lost and does not kill the wrapper: the job is not
+# started, the stop is logged and the streak is left alone.
+test_lr_stop_27() {
+  local spec cmd arg sig code marker what killed lost
+  echo '# lr-stop #27: a stop before the job is forked'
+  for spec in mkdir::TERM mkdir::HUP mkdir::INT date:+%s:TERM; do
+    IFS=: read -r cmd arg sig <<<"${spec}"
+    code=$((128 + $(kill -l "${sig}")))
+    what="#27 SIG${sig} during ${cmd}${arg:+ ${arg}}"
+    # Unfixed, TERM and HUP kill the wrapper. bash 3.2 outlives an INT that
+    # lands while it waits for a command, so INT is lost instead: the job
+    # runs as if nothing had happened.
+    killed='lr-stop:'
+    lost='lr-stop-guard:'
+    if [ "${sig}" = INT ]; then
+      killed='lr-stop-guard:'
+      lost='lr-stop:'
+    fi
+    new_case
+    seed_counter svc 1
+    marker="${CASE_DIR}/ran"
+    lr_stop_gate "${cmd}" "${arg}"
+    lr_stop_start svc -- /usr/bin/touch "${marker}"
+    if ! lr_stop_wait_for "${CASE_DIR}/ready"; then
+      check "lr-stop-guard: ${what}: wrapper reached the gate" false
+      : >"${CASE_DIR}/go"
+      lr_stop_finish 20
+    else
+      kill "-${sig}" "${LR_WPID}"
+      : >"${CASE_DIR}/go"
+      lr_stop_finish 20
+      check "${killed} ${what}: wrapper not killed by it" lr_stop_not_killed
+      check "lr-stop: ${what}: exits ${code}" lr_stop_exited_with "${code}"
+      check "lr-stop: ${what}: logged as a stop before the job started" \
+        audit_has 'stopped by signal before the job started - not counted'
+      check "${lost} ${what}: job not started" path_absent "${marker}"
+      check "${lost} ${what}: streak of 1 untouched" counter_is svc 1
+      check "lr-stop-guard: ${what}: no banner" calls_are 0
+    fi
+    LR_PATH_PREFIX=''
+    LR_GATE_CMD=''
+    LR_GATE_ARG=''
+  done
+}
+
+# Issue #37: USR1, USR2 and ALRM are passed to the job as themselves and the
+# wrapper keeps waiting; PIPE and QUIT are ignored by the wrapper. None of
+# them ends the wrapper or loses the outcome line.
+test_lr_stop_37() {
+  local sig word
+  echo '# lr-stop #37: USR1, USR2 and ALRM reach the job as themselves'
+  for sig in USR1 USR2 ALRM; do
+    new_case
+    lr_stop_job "trap 'echo ${sig} >\"\$1.got\"; exit 3' ${sig}
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+    if ! lr_stop_start_job; then
+      check "lr-stop-guard: #37 SIG${sig}: wrapper started the job" false
+      lr_stop_finish 0
+    else
+      kill "-${sig}" "${LR_WPID}"
+      lr_stop_finish 20
+      check "lr-stop: #37 SIG${sig}: the job got SIG${sig}" \
+        lr_stop_file_is "${CASE_DIR}/child.pid.got" "${sig}"
+      check "lr-stop: #37 SIG${sig}: wrapper not killed by it" \
+        lr_stop_not_killed
+      check "lr-stop: #37 SIG${sig}: the job's exit 3 passed through" \
+        lr_stop_exited_with 3
+      check "lr-stop: #37 SIG${sig}: outcome logged" audit_has 'exit 3'
+    fi
+    lr_stop_reap
+  done
+
+  echo '# lr-stop #37: PIPE and QUIT do not end the wrapper'
+  for sig in PIPE QUIT; do
+    new_case
+    lr_stop_job "echo \$\$ >\"\$1\"
+while [ ! -e \"\$1.go\" ]; do /bin/sleep 0.1; done
+exit 7"
+    if ! lr_stop_start_job; then
+      check "lr-stop-guard: #37 SIG${sig}: wrapper started the job" false
+      lr_stop_finish 0
+    else
+      kill "-${sig}" "${LR_WPID}"
+      : >"${CASE_DIR}/child.pid.go"
+      lr_stop_finish 20
+      check "lr-stop: #37 SIG${sig}: wrapper not killed by it" \
+        lr_stop_not_killed
+      check "lr-stop: #37 SIG${sig}: the job's exit 7 passed through" \
+        lr_stop_exited_with 7
+      check "lr-stop: #37 SIG${sig}: outcome logged" \
+        audit_has 'FAILED exit 7 ('
+    fi
+    lr_stop_reap
+  done
+
+  echo '# lr-stop #37: a USR1 while a stopped job shuts down is passed on'
+  new_case
+  lr_stop_job "trap 'echo TERM >>\"\$1.terms\"' TERM
+trap 'echo USR1 >\"\$1.got\"; exit 4' USR1
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job; then
+    check 'lr-stop-guard: #37 USR1 after a stop: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    if ! lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1; then
+      check 'lr-stop-guard: #37 USR1 after a stop: SIGTERM forwarded' false
+    fi
+    kill -USR1 "${LR_WPID}" 2>/dev/null
+    lr_stop_finish 20
+    check 'lr-stop: #37 USR1 after a stop: the job got SIGUSR1' \
+      lr_stop_file_is "${CASE_DIR}/child.pid.got" USR1
+    check "lr-stop: #37 USR1 after a stop: the job's exit 4 passed through" \
+      lr_stop_exited_with 4
+    check 'lr-stop: #37 USR1 after a stop: logged as a stop' \
+      audit_has 'stopped by signal (exit 4,'
+  fi
+  lr_stop_reap
+
+  # The wrapper may ignore PIPE, but the job must not inherit that: a job
+  # that writes to a closed pipe dies of it, as it would without the wrapper.
+  # Through the launcher, so that the wrapper itself starts with SIGPIPE at
+  # its default whatever the suite inherited.
+  new_case
+  lr_stop_start job -- /bin/sh -c 'kill -PIPE $$; exit 0'
+  lr_stop_finish 20
+  check 'lr-stop-guard: #37 the job starts with SIGPIPE at its default' \
+    rc_is 141
+
+  for word in USR1 USR2 ALRM PIPE STOP; do
+    check "lr-stop: #37 README says what SIG${word} does" \
+      lr_stop_readme_has "${word}"
+  done
+}
+
+# Issue #25: after a stop the wrapper waits for the job, however many more
+# stops arrive (each forwarded as SIGTERM again), and logs and returns the
+# job's own status, a death by signal included. --kill-after still ends the
+# wait at its deadline.
+test_lr_stop_25() {
+  local child
+  echo '# lr-stop #25: three stops while the job shuts down'
+  new_case
+  seed_counter svc 1
+  lr_stop_job "n=0
+log=\"\$HOME/Library/Logs/launchd-run.log\"
+trap 'n=\$((n + 1)); echo TERM >>\"\$1.terms\"
+if [ \"\$n\" -ge 3 ]; then
+  grep -q \"stopped by signal\" \"\$log\" && echo early >\"\$1.early\"
+  exit 5
+fi' TERM
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job; then
+    check 'lr-stop-guard: #25 three stops: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1
+    kill -HUP "${LR_WPID}" 2>/dev/null
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 2
+    kill -INT "${LR_WPID}" 2>/dev/null
+    lr_stop_finish 20
+    check 'lr-stop: #25 three stops: each forwarded, three SIGTERMs' \
+      lr_stop_lines_are "${CASE_DIR}/child.pid.terms" 3
+    check "lr-stop: #25 three stops: the job's exit 5 passed through" \
+      lr_stop_exited_with 5
+    check "lr-stop: #25 three stops: logged with the job's exit 5" \
+      audit_has 'stopped by signal (exit 5,'
+    check 'lr-stop-guard: #25 three stops: no outcome before the job ended' \
+      path_absent "${CASE_DIR}/child.pid.early"
+    check 'lr-stop-guard: #25 three stops: streak of 1 untouched' \
+      counter_is svc 1
+    check 'lr-stop-guard: #25 three stops: no banner' calls_are 0
+  fi
+  lr_stop_reap
+
+  echo '# lr-stop #25: the job dies of SIGKILL after a second stop'
+  new_case
+  lr_stop_job "trap 'echo TERM >>\"\$1.terms\"' TERM
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job; then
+    check 'lr-stop-guard: #25 death by signal: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1
+    kill -TERM "${LR_WPID}" 2>/dev/null
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 2
+    # No stop after this: one just after a death by signal is issue #52.
+    child="$(cat "${CASE_DIR}/child.pid")"
+    kill -KILL "${child}"
+    lr_stop_finish 20
+    check "lr-stop: #25 death by signal: the job's 137 passed through" \
+      lr_stop_exited_with 137
+    check "lr-stop: #25 death by signal: logged with the job's 137" \
+      audit_has 'stopped by signal (exit 137,'
+  fi
+  lr_stop_reap
+
+  echo '# lr-stop #25: with --kill-after a second stop keeps the deadline'
+  new_case
+  lr_stop_job "trap 'echo TERM >>\"\$1.terms\"' TERM
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  if ! lr_stop_start_job --kill-after 2; then
+    check 'lr-stop-guard: #25 --kill-after: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    kill -TERM "${LR_WPID}"
+    lr_stop_wait_lines "${CASE_DIR}/child.pid.terms" 1
+    kill -HUP "${LR_WPID}" 2>/dev/null
+    lr_stop_finish 30
+    check 'lr-stop-guard: #25 --kill-after: killed at the deadline, 137' \
+      lr_stop_exited_with 137
+    check 'lr-stop-guard: #25 --kill-after: the SIGKILL is logged' \
+      audit_has 'stopped by signal, SIGKILL after 2s (exit 137, '
+    check 'lr-stop-guard: #25 --kill-after: job gone' \
+      pid_gone "$(cat "${CASE_DIR}/child.pid")"
+  fi
+  lr_stop_reap
+}
+
+# Issue #41: without set -e, the "|| true" after the label's shift is dead.
+test_lr_stop_41() {
+  echo '# lr-stop #41: the label shift'
+  check 'lr-stop: #41 the dead "shift || true" is gone' \
+    lr_stop_source_lacks 'shift || true'
+}
+
+# --- lr-env: the job's environment, HOME and command lookup. -----------------
+
+# Every name the wrapper sets or declares (issue #23).
+readonly LR_ENV_NAMES='REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES
+  AUDIT_KEEP_LINES alert_after kill_after state started stopped pid code
+  killed woke deadline_done fails prev fails_file elapsed sig'
+# Of those, the locals of main first assigned after the job is forked: the
+# job already gets the caller's value of these.
+readonly LR_ENV_LATE=' code fails prev fails_file elapsed sig '
+# Every function the wrapper defines (issue #30).
+readonly LR_ENV_FUNCS='note notify main rotate_audit usage_error repo_version
+  forward_signal kill_at_deadline'
+
+# Read by lr_env_wrap: a directory put first on PATH, if not empty, and the
+# REPO_VERSION to pin, none if empty.
+LR_ENV_PATH=''
+LR_ENV_VERSION="${TEST_VERSION}"
+# Set by lr_env_dump_job.
+LR_ENV_JOB=()
+
+#######################################
+# Runs the wrapper inside the current case, like run_wrap, with a chosen
+# HOME and extra variables in its environment.
+# Globals:
+#   RC (set to the wrapper's exit status)
+#   LR_ENV_PATH, LR_ENV_VERSION (read)
+# Arguments:
+#   HOME: "case" (the case's HOME), "unset" or "empty"; then NAME=value
+#   pairs; then "::"; then arguments for launchd-run.sh.
+#######################################
+lr_env_wrap() {
+  local home="$1"
+  local cmd=(/usr/bin/env)
+  shift
+  case "${home}" in
+    unset) cmd+=(-u HOME) ;;
+    empty) cmd+=(HOME=) ;;
+    *) cmd+=("HOME=${CASE_HOME}") ;;
+  esac
+  cmd+=("PATH=${LR_ENV_PATH:+${LR_ENV_PATH}:}${STUB_BIN}:${SYS_PATH}")
+  cmd+=("OSASCRIPT_CALLS=${CASE_DIR}/osascript.calls")
+  if [ -n "${LR_ENV_VERSION}" ]; then
+    cmd+=("REPO_VERSION=${LR_ENV_VERSION}")
+  fi
+  while [ "$#" -gt 0 ] && [ "$1" != '::' ]; do
+    cmd+=("$1")
+    shift
+  done
+  shift
+  "${cmd[@]}" "${WRAPPER}" "$@" >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
+  RC=$?
+}
+
+#######################################
+# Sets LR_ENV_JOB to the command line of a job that records, for each name
+# given, whether it is in its environment and its value, in
+# $CASE_DIR/env/<name> ("set:<value>" or "unset"), then exits with the given
+# status.
+# Globals:
+#   LR_ENV_JOB (set)
+# Arguments:
+#   The exit status, then the names.
+#######################################
+lr_env_dump_job() {
+  local status="$1"
+  shift
+  mkdir -p "${CASE_DIR}/env"
+  # shellcheck disable=SC2016  # $d, $s and the rest belong to perl.
+  LR_ENV_JOB=(/usr/bin/perl -e
+    'my ($d, $s) = splice(@ARGV, 0, 2);
+    for my $n (@ARGV) {
+      open(my $h, ">", "$d/$n") or die;
+      print $h (exists $ENV{$n} ? "set:$ENV{$n}" : "unset");
+      close($h);
+    }
+    exit $s' "${CASE_DIR}/env" "${status}" "$@")
+}
+
+# The job saw this name with exactly this value ("unset" for none).
+lr_env_job_saw() {
+  local want="$2"
+  [ -f "${CASE_DIR}/env/$1" ] || return 1
+  [ "${want}" = unset ] || want="set:${want}"
+  [ "$(
+    cat "${CASE_DIR}/env/$1"
+    echo x
+  )" = "${want}x" ]
+}
+
+# Lines on the wrapper's stderr.
+lr_env_err_lines_are() {
+  [ "$(wc -l <"${CASE_DIR}/err" | tr -d ' ')" -eq "$1" ]
+}
+
+# The wrapper's stderr holds exactly one line, and it is not bash's own
+# complaint about an unset variable.
+lr_env_one_warning() {
+  lr_env_err_lines_are 1 && ! err_has 'unbound variable'
+}
+
+# The file exists and the wrapper exited with this status.
+lr_env_ran_with() { [ -e "$1" ] && rc_is "$2"; }
+
+# Two start lines, the first not empty, are the same.
+lr_env_same_start() { [ -n "$1" ] && [ "$1" = "$2" ]; }
+
+lr_env_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+
+# The first audit line with its timestamp and label cut off.
+lr_env_start_line() {
+  sed -n '1s/^.*started: /started: /p' \
+    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
+}
+
+# Issue #23: a variable the caller set under a name the wrapper also uses
+# reaches the job with the caller's value, and the wrapper itself still logs
+# to its own audit file under its own label.
+test_lr_env_23() {
+  local name nasty unset_ok start_plain start_root tag
+  echo '# lr-env #23: the caller'"'"'s variables reach the job intact'
+  # shellcheck disable=SC2016  # Meant literally: it must never run.
+  nasty=$'two words\n"dq" \'sq\' \\ * ; | & `x` $(touch pwned) $HOME'
+  for name in ${LR_ENV_NAMES}; do
+    new_case
+    lr_env_dump_job 0 "${name}" LR_ENV_CONTROL
+    (cd "${CASE_DIR}" \
+      && lr_env_wrap case "${name}=${name}:${nasty}" LR_ENV_CONTROL=c :: \
+        job -- "${LR_ENV_JOB[@]}")
+    RC="$?"
+    tag='lr-env:'
+    case "${LR_ENV_LATE}" in
+      *" ${name} "*) tag='lr-env-guard:' ;;
+    esac
+    check "${tag} #23 ${name}: reaches the job with the caller's value" \
+      lr_env_job_saw "${name}" "${name}:${nasty}"
+    check "lr-env-guard: #23 ${name}: control variable intact" \
+      lr_env_job_saw LR_ENV_CONTROL c
+    check "lr-env-guard: #23 ${name}: the job still exits 0" rc_is 0
+    check "lr-env-guard: #23 ${name}: the value was never run" \
+      path_absent "${CASE_DIR}/pwned"
+  done
+
+  for name in LABEL state AUDIT; do
+    new_case
+    lr_env_dump_job 0 "${name}"
+    lr_env_wrap case "${name}=" :: job -- "${LR_ENV_JOB[@]}"
+    check "lr-env: #23 ${name} set empty: reaches the job set and empty" \
+      lr_env_job_saw "${name}" ''
+  done
+
+  echo '# lr-env #23: names the caller did not set stay unset'
+  new_case
+  # shellcheck disable=SC2086  # The list is split on purpose.
+  lr_env_dump_job 0 ${LR_ENV_NAMES}
+  lr_env_wrap case :: job -- "${LR_ENV_JOB[@]}"
+  unset_ok=1
+  for name in ${LR_ENV_NAMES}; do
+    lr_env_job_saw "${name}" unset || unset_ok=''
+  done
+  check 'lr-env-guard: #23 no wrapper name appears in the job unasked' \
+    [ -n "${unset_ok}" ]
+
+  echo '# lr-env #23: the wrapper keeps its own label, log and streak'
+  new_case
+  seed_counter job 1
+  lr_env_wrap case LABEL=other "AUDIT=${CASE_DIR}/other.log" \
+    "state=${CASE_DIR}/other-state" "fails_file=${CASE_DIR}/other-count" \
+    alert_after=99 kill_after=1 stopped=15 pid=notapid code=0 \
+    EX_USAGE=7 AUDIT_MAX_BYTES=1 AUDIT_KEEP_LINES=1 \
+    "LIB=${CASE_DIR}/nolib.sh" prev=50 fails=50 started=0 :: \
+    job -- /bin/sh -c 'exit 3'
+  check 'lr-env-guard: #23 all names set: the job'"'"'s exit 3 passed' rc_is 3
+  check 'lr-env-guard: #23 all names set: logged under the real label' \
+    audit_line_has 2 ' job '
+  check 'lr-env-guard: #23 all names set: failure logged, streak 2' \
+    audit_has 'FAILED exit 3 ('
+  check 'lr-env-guard: #23 all names set: counter now 2' counter_is job 2
+  check 'lr-env-guard: #23 all names set: banner at the default --after 2' \
+    calls_are 1
+  check 'lr-env-guard: #23 all names set: no log at the caller'"'"'s AUDIT' \
+    path_absent "${CASE_DIR}/other.log"
+  check 'lr-env-guard: #23 all names set: no state at the caller'"'"'s path' \
+    path_absent "${CASE_DIR}/other-state"
+  check 'lr-env-guard: #23 all names set: log not trimmed' \
+    audit_lines_are 3
+
+  new_case
+  lr_env_wrap case EX_USAGE=7 :: job --bogus -- /usr/bin/true
+  check 'lr-env-guard: #23 EX_USAGE set: a usage error still exits 64' \
+    rc_is 64
+
+  echo '# lr-env #23: a caller'"'"'s REPO_ROOT does not change the version'
+  LR_ENV_VERSION=''
+  new_case
+  lr_env_wrap case :: job -- /usr/bin/true
+  start_plain="$(lr_env_start_line)"
+  new_case
+  lr_env_wrap case "REPO_ROOT=${CASE_DIR}" :: job -- /usr/bin/true
+  start_root="$(lr_env_start_line)"
+  LR_ENV_VERSION="${TEST_VERSION}"
+  check 'lr-env-guard: #23 REPO_ROOT set: start line names the checkout' \
+    lr_env_same_start "${start_plain}" "${start_root}"
+}
+
+# Issue #26: with HOME unset or empty the wrapper runs the command directly
+# with no bookkeeping and one warning line on stderr, and exits with the
+# command's status. A malformed command line still exits 64 first.
+test_lr_env_26() {
+  local home marker tag quiet
+  for home in unset empty; do
+    echo "# lr-env #26: HOME ${home}"
+    # With HOME empty the job already runs; its bookkeeping is the bug.
+    tag='lr-env:'
+    quiet='lr-env-guard:'
+    if [ "${home}" = empty ]; then
+      tag='lr-env-guard:'
+      quiet='lr-env:'
+    fi
+    new_case
+    marker="${CASE_DIR}/ran"
+    # shellcheck disable=SC2016  # $1 belongs to the job's own sh.
+    lr_env_wrap "${home}" :: job --after 1 -- \
+      /bin/sh -c 'touch "$1"; echo job-out; exit 7' sh "${marker}"
+    check "${tag} #26 HOME ${home}: the job ran" [ -e "${marker}" ]
+    check "${tag} #26 HOME ${home}: exit status is the job's 7" rc_is 7
+    check "${tag} #26 HOME ${home}: job stdout passed through" \
+      out_is job-out
+    check "lr-env: #26 HOME ${home}: one warning line on stderr" \
+      lr_env_one_warning
+    check "${quiet} #26 HOME ${home}: no banner, even at --after 1" \
+      calls_are 0
+
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_wrap "${home}" :: job -- /usr/bin/touch "${marker}"
+    check "${tag} #26 HOME ${home}: a good job runs, exit 0" \
+      lr_env_ran_with "${marker}" 0
+
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_wrap "${home}" :: job --after 3 --kill-after 5 -- \
+      /usr/bin/touch "${marker}"
+    check "${tag} #26 HOME ${home}: options still parsed, the job runs" \
+      [ -e "${marker}" ]
+
+    new_case
+    lr_env_dump_job 0 LABEL
+    lr_env_wrap "${home}" LABEL=mine :: job -- "${LR_ENV_JOB[@]}"
+    check "lr-env: #26 HOME ${home}: the caller's LABEL reaches the job" \
+      lr_env_job_saw LABEL mine
+
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_wrap "${home}" :: job --bogus -- /usr/bin/touch "${marker}"
+    check "lr-env-guard: #26 HOME ${home}: unknown flag still exits 64" \
+      rc_is 64
+    check "lr-env-guard: #26 HOME ${home}: unknown flag: job not run" \
+      path_absent "${marker}"
+    new_case
+    lr_env_wrap "${home}" :: job --after 0 -- /usr/bin/touch "${marker}"
+    check "lr-env-guard: #26 HOME ${home}: --after 0 still exits 64" rc_is 64
+    new_case
+    lr_env_wrap "${home}" :: job
+    check "lr-env-guard: #26 HOME ${home}: no command still exits 64" \
+      rc_is 64
+  done
+
+  echo '# lr-env #26: README'
+  check 'lr-env: #26 README covers a LaunchDaemon' \
+    lr_env_readme_has LaunchDaemon
+  check 'lr-env: #26 README names UserName' lr_env_readme_has UserName
+}
+
+#######################################
+# Writes a program named like one of the wrapper's functions into the
+# case's $CASE_DIR/path, which it puts first on PATH. It writes "ran" to the
+# file given as its first argument and exits with the given status.
+# Globals:
+#   LR_ENV_PATH (set)
+# Arguments:
+#   The name, then the exit status.
+#######################################
+lr_env_path_program() {
+  mkdir -p "${CASE_DIR}/path"
+  # shellcheck disable=SC2016  # $1 belongs to the program.
+  printf '#!/bin/sh\necho ran >"$1"\nexit %s\n' "$2" >"${CASE_DIR}/path/$1"
+  chmod +x "${CASE_DIR}/path/$1"
+  LR_ENV_PATH="${CASE_DIR}/path"
+}
+
+# Issue #30: a command named like one of the wrapper's functions runs the
+# program on PATH, never the function.
+test_lr_env_30() {
+  local name code=10 marker
+  echo '# lr-env #30: commands named like the wrapper'"'"'s functions'
+  for name in ${LR_ENV_FUNCS}; do
+    code=$((code + 1))
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_path_program "${name}" "${code}"
+    lr_env_wrap case :: job -- "${name}" "${marker}"
+    check "lr-env: #30 ${name}: the program on PATH ran" [ -e "${marker}" ]
+    check "lr-env: #30 ${name}: its exit ${code} passed through" \
+      rc_is "${code}"
+    check "lr-env: #30 ${name}: its exit ${code} logged" \
+      audit_has "FAILED exit ${code} ("
+    LR_ENV_PATH=''
+  done
+
+  for name in note main; do
+    new_case
+    marker="${CASE_DIR}/ran"
+    lr_env_path_program "${name}" 0
+    lr_env_wrap unset :: job -- "${name}" "${marker}"
+    check "lr-env: #30 HOME unset: ${name} runs the program on PATH" \
+      lr_env_ran_with "${marker}" 0
+    LR_ENV_PATH=''
+  done
+}
+
 main() {
   if [ ! -x "${WRAPPER}" ]; then
     echo "run.sh: wrapper not found or not executable: ${WRAPPER}" >&2
@@ -1089,6 +1829,13 @@ main() {
   test_kill_after_arguments
   test_kill_deadline
   test_log_rotation
+  test_lr_stop_27
+  test_lr_stop_37
+  test_lr_stop_25
+  test_lr_stop_41
+  test_lr_env_23
+  test_lr_env_26
+  test_lr_env_30
 
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]

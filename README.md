@@ -24,6 +24,15 @@ that cannot be cleared raises no "Back to normal" banner. `--kill-after` is
 for a command that ignores SIGTERM; see
 ["A command that ignores SIGTERM"](#a-command-that-ignores-sigterm).
 
+The command runs in the environment the wrapper was started with, whatever
+names the wrapper uses inside, and is looked up on `PATH` like any program, so
+a command called `note` or `main` is the program, not one of the wrapper's
+functions. A job that has no `HOME` (a LaunchDaemon without `UserName`) gets no
+bookkeeping: the wrapper prints one warning line on stderr and runs the command
+directly, with no audit line, no counter and no banner, and exits with the
+command's status. An empty `HOME` counts as none. Banners need a login session
+as well, so a job outside one never raises them.
+
 ## Install
 
 ```sh
@@ -63,8 +72,44 @@ forwards SIGTERM to the command, waits for it to exit and then logs the stop
 (`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line and
 no orphaned command, provided the command exits on SIGTERM (the next section
 covers one that does not). A command that handles SIGTERM is logged as stopped
-whatever code it exits with, 0 or 1 included. One side effect: the command runs as a background job of the wrapper, so
-it starts with SIGINT and SIGQUIT ignored.
+whatever code it exits with, 0 or 1 included. Further SIGHUP, SIGINT or
+SIGTERM during the shutdown are forwarded as SIGTERM again; the wrapper logs
+and exits only once the command has exited, with the command's own status.
+The traps are in place before the command is forked. A stop the wrapper has
+seen by the time it forks the command means the command is never run (the
+forked process checks for it before it execs the command): the wrapper logs
+`stopped by signal before the job started - not counted`, leaves the counter
+alone and exits with 128 plus the signal number. A stop after the fork is
+forwarded as SIGTERM, which reaches the command whether or not it has been
+exec'd yet, and is logged as any other stop. (If it lands in the first instant
+after the fork, bash 3.2 prints two `run_pending_traps` warnings on the
+command's stderr as it passes the SIGTERM on.)
+
+Some stops are still lost. bash acts on a trapped signal only between
+commands, and the wrapper's `wait` is a command: a stop that lands after bash
+has looked for signals on its way into that `wait`, but before the `wait`
+blocks (about a microsecond of bash 3.2's command set-up, but a loaded machine
+can stretch it), is acted on only when the `wait` ends, which is when the
+command exits or another signal reaches the wrapper. Until then the command is
+not told, and a `--kill-after` deadline does not start. Under `/bin/bash` 3.2,
+with SIGTERM sent 0 to 1.5 ms after the fork, 8 stops in 2,000 runs were lost
+on a loaded machine, most likely in this instant. In 3 of the 2,000 runs the
+wrapper itself died (twice of SIGSEGV inside bash's signal handling, once of
+SIGKILL), leaving the command running as an orphan with only the start line
+logged. A stop that lands before the traps are installed, while the wrapper
+is still starting up, kills the wrapper before it has started the command.
+
+Other signals sent to the wrapper do not end it either:
+
+- SIGUSR1, SIGUSR2 and SIGALRM are passed on to the command as themselves, and
+  the wrapper keeps waiting.
+- SIGPIPE is ignored by the wrapper (the command keeps its default).
+- SIGQUIT is ignored by the wrapper, as it is by the command (below).
+- SIGSTOP cannot be trapped: it pauses only the wrapper, not the command, and
+  the wrapper carries on when it is continued.
+
+One side effect: the command runs as a background job of the wrapper, so it
+starts with SIGINT and SIGQUIT ignored.
 
 ## A command that ignores SIGTERM
 
@@ -111,10 +156,9 @@ goes with `<key>ExitTimeOut</key><integer>20</integer>` in the same plist.
 - The SIGKILL goes to the command's own pid, as the forwarded SIGTERM does.
   Processes the command started are not signalled
   ([#44](https://github.com/JJBalisan/launchd-run/issues/44)).
-- The deadline starts when the wrapper, already waiting on the command, is
-  signalled. A stop in the first instant of a run, before the wrapper waits,
-  is not covered
-  ([#27](https://github.com/JJBalisan/launchd-run/issues/27)).
+- The deadline starts when the wrapper first sees the stop, wherever it is
+  in its wait loop, and is not restarted by later signals. A stop that lands
+  in the instant described above is seen only when that `wait` ends.
 
 ## Log rotation
 
