@@ -13,6 +13,22 @@ writes, MINOR adds a flag or a behaviour, PATCH fixes one.
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-11-24
+
+### Fixed
+
+- A missing `~/Library/Logs` is created, and an audit log that cannot be
+  written gives one warning line instead of bash errors on the job's
+  stderr (#58).
+
+### Changed
+
+- The README describes the remaining hang or crash inside bash 3.2's
+  `wait` when a stop arrives just after the job dies of a signal (#52).
+- Tests only: no fixed sleep before signalling the wrapper, one helper
+  for the wrapper's environment, less duplication, and the suite removes
+  only the macOS crash reports it caused (#32, #39, #40, #53).
+
 ## [3.0.0] - 2026-11-24
 
 ### Added
@@ -150,7 +166,8 @@ audit fixes (#8) and the single-script CI (#9).
   `tests/version.sh` for the lib; `tests/ci.sh` is the whole CI as one
   script and the workflow's only step (#9), linting every tracked `.sh`.
 
-[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/JJBalisan/launchd-run/compare/v3.0.1...HEAD
+[3.0.1]: https://github.com/JJBalisan/launchd-run/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/JJBalisan/launchd-run/compare/v2.0.0...v3.0.0
 [2.0.0]: https://github.com/JJBalisan/launchd-run/compare/v1.0.4...v2.0.0
 [1.0.4]: https://github.com/JJBalisan/launchd-run/compare/v1.0.3...v1.0.4
