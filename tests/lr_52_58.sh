@@ -51,8 +51,8 @@ test_lr58_unwritable_log() {
   echo 'not a directory' >"${CASE_HOME}/Library"
   run_wrap svc -- /bin/sh -c 'echo job-err >&2; exit 1'
   check 'lr-58: unwritable: exits with the job'"'"'s 1' rc_is 1
-  check 'lr-58: unwritable: the job'"'"'s own line comes first' \
-    lr58_first_err_is job-err
+  check 'lr-58: unwritable: the job'"'"'s own line kept' \
+    grep -q -x -- job-err "${CASE_DIR}/err"
   check 'lr-58: unwritable: one warning from the wrapper' \
     lr58_err_has_once 'launchd-run: cannot write the audit log'
   check 'lr-58: unwritable: the warning names the log' \

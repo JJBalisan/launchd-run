@@ -17,7 +17,11 @@ must not contain `/` or start with `.`; anything else is a usage error
 `~/Library/Logs/launchd-run.log`: every run writes a start line,
 `started: launchd-run <version>`, naming the wrapper's own checkout (see
 "Releasing"), then an outcome line; per-job counters in
-`~/.local/state/launchd-run/<label>/`. A counter file that does not hold a
+`~/.local/state/launchd-run/<label>/`. Both directories are made if they are
+missing. When the audit log cannot be written, the wrapper says so once per
+run on stderr (`launchd-run: cannot write the audit log ...`), which launchd
+sends to the job's `StandardErrorPath`; the job itself is run and counted as
+usual. A counter file that does not hold a
 plain decimal number of at most 9 digits reads as 0, so a corrupt one restarts
 the streak rather than breaking the wrapper. A counter that cannot be written
 at all (say, a root-owned `~/.local/state`) raises a banner on every failure
