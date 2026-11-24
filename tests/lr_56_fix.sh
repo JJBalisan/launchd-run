@@ -142,6 +142,40 @@ while :; do /bin/sleep 0.1; done"
   lr_stop_reap
 }
 
+# N2: the wait loop clears woke and next_wait before it looks for a stop, so
+# a stop whose trap runs at that reset still starts the deadline. Same setup
+# as the check above; SIGTERM is injected at the second "woke=''".
+test_lr56_stop_at_reset() {
+  local env_file
+  echo '# lr-56: --kill-after, a stop as the wait loop resets woke'
+  new_case
+  lr_stop_job "trap 'echo TERM >>\"\$1.terms\"' TERM
+trap 'echo USR1 >>\"\$1.usr1\"' USR1
+echo \$\$ >\"\$1\"
+while :; do /bin/sleep 0.1; done"
+  env_file="${CASE_DIR}/env.bash"
+  lr56_env "${env_file}" 'woke=??' 2 'kill -TERM $$'
+  BASH_ENV="${env_file}" lr_stop_start svc --kill-after 2 -- \
+    "${CASE_DIR}/job.sh" "${CASE_DIR}/child.pid"
+  if ! lr_stop_wait_for "${CASE_DIR}/child.pid"; then
+    check 'lr-56-guard: at reset: wrapper started the job' false
+    lr_stop_finish 0
+  else
+    sleep 1
+    kill -USR1 "${LR_WPID}"
+    lr_stop_finish 15
+    check 'lr-56-guard: at reset: SIGTERM injected' lr56_injected
+    check 'lr-56-guard: at reset: the job got the SIGTERM' \
+      lr_stop_file_is "${CASE_DIR}/child.pid.terms" TERM
+    check 'lr-56: at reset: wrapper ended by itself' lr_stop_not_killed
+    check 'lr-56: at reset: killed at the deadline, 137' \
+      lr_stop_exited_with 137
+    check 'lr-56: at reset: the SIGKILL is logged' \
+      audit_has 'stopped by signal, SIGKILL after 2s (exit 137, '
+  fi
+  lr_stop_reap
+}
+
 # F3: from the --kill-after SIGKILL on, USR1, USR2 and ALRM are ignored like
 # HUP, INT and TERM, so none can interrupt the reap (issue #52). The traps in
 # force are read as the wrapper is about to send the SIGKILL.
@@ -226,6 +260,7 @@ main() {
   echo "lr-56 checks (bash ${BASH_VERSION}) against ${WRAPPER}"
   test_lr56_stop_before_exec
   test_lr56_stop_at_wait
+  test_lr56_stop_at_reset
   test_lr56_guard_at_sigkill
   test_lr56_stop_before_fork
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
