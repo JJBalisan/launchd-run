@@ -227,15 +227,8 @@ sel_raw() {
   local home="$1"
   shift
   sel_env_cmd "${home}"
-  # shellcheck disable=SC2016  # $? and $f belong to perl.
-  (cd "${CASE_DIR}" \
-    && "${SEL_CMD[@]}" /usr/bin/perl -e 'my $f = shift; system(@ARGV);
-        open(my $h, ">", $f) or die; print $h ($? & 127);
-        exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' \
-      "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
-      >"${CASE_DIR}/out" 2>"${CASE_DIR}/err")
-  RC=$?
-  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+  # Through run.sh's launcher, so the crash report it causes is removed.
+  raw_run "${SEL_CMD[@]}" "${WRAPPER}" "$@"
 }
 
 sel_killed_by() { [ "${KILLED_BY}" = "$1" ]; }

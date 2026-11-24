@@ -6,8 +6,18 @@
 #
 # Hermetic: every case gets its own temporary HOME (which holds both the
 # per-label fail counters and the audit log), and a stub osascript sits first
-# on PATH and records each call to a file instead of raising a banner. Nothing
-# outside the temp directory is written, and no network is used.
+# on PATH and records each call to a file instead of raising a banner. No
+# network is used, and the suite itself writes nothing outside the temp
+# directory, with one exception it cannot prevent: the crash-signal cases make
+# the wrapper's bash (and some jobs) really die of SIGSEGV, SIGBUS or SIGABRT,
+# since launchd's KeepAlive Crashed key depends on it, and macOS files a crash
+# report (bash-<date>.ips) in ~/Library/Logs/DiagnosticReports for such a
+# death, though it skips repeats in quick succession. No setting a shell can
+# reach turns that off for one process. So the launcher of those cases
+# records each pid it starts, and on exit the suite removes the reports that
+# were created during the run for one of those pids or its children, and
+# prints how many; it touches no other report. One filed after the suite has
+# exited stays. LAUNCHD_RUN_CRASH_REPORTS names another directory to look in.
 #
 # Assertions print "ok" or "FAIL".
 #
@@ -29,6 +39,15 @@ readonly TEST_VERSION='vTEST'
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/launchd-run-tests.XXXXXX")" || exit 2
 readonly TMP_ROOT
 readonly STUB_BIN="${TMP_ROOT}/bin"
+# One line per pid that raw_run started: the processes that may crash.
+readonly CRASH_PIDS="${TMP_ROOT}/crash.pids"
+CRASH_REPORTS="${LAUNCHD_RUN_CRASH_REPORTS:-}"
+if [ -z "${CRASH_REPORTS}" ] && [ -n "${HOME:-}" ]; then
+  CRASH_REPORTS="${HOME}/Library/Logs/DiagnosticReports"
+fi
+readonly CRASH_REPORTS
+# A report created before this second is not the run's.
+SUITE_START="$(date +%s)"
 
 passes=0
 failures=0
@@ -38,18 +57,63 @@ leftover_pids=''
 # Set by new_case and run_wrap.
 CASE_HOME=''
 CASE_DIR=''
+# The case's audit log, stub osascript record and state directory: the one
+# spelling of each path.
+CASE_LOG=''
+CASE_CALLS=''
+CASE_STATE=''
 RC=0
+# Set by wrap_env.
+WRAP_ENV=()
 # Read by launchd_stop: a SECONDS for the wrapper to inherit, if not empty.
 WRAPPER_SECONDS=''
 
 #######################################
-# Kills any job process a test left behind and removes the temp tree.
+# Removes the macOS crash reports this run caused (see the header): those in
+# $CRASH_REPORTS created since the run began whose process is one raw_run
+# started or a child of one, matched on the report's own pid fields. Removes
+# at most two per recorded pid (the wrapper and its job).
+# Outputs:
+#   How many it removed, if any.
+#######################################
+remove_own_crash_reports() {
+  local f pid ppid born key n=0
+  local done_list="${TMP_ROOT}/crash-removed"
+  [ -s "${CRASH_PIDS}" ] && [ -d "${CRASH_REPORTS}" ] || return 0
+  : >"${done_list}"
+  for f in "${CRASH_REPORTS}"/bash-*.ips "${CRASH_REPORTS}"/sh-*.ips; do
+    [ -f "${f}" ] || continue
+    born="$(/usr/bin/stat -f %B "${f}" 2>/dev/null)" || continue
+    [ "${born}" -ge "${SUITE_START}" ] || continue
+    pid="$(sed -n 's/^  "pid" : \([0-9][0-9]*\),$/\1/p' "${f}")"
+    ppid="$(sed -n 's/^  "parentPid" : \([0-9][0-9]*\),$/\1/p' "${f}")"
+    # The recorded pid this report belongs to: its own, or its parent's.
+    if [ -n "${pid}" ] && grep -F -x -q -e "${pid}" "${CRASH_PIDS}"; then
+      key="${pid}"
+    elif [ -n "${ppid}" ] && grep -F -x -q -e "${ppid}" "${CRASH_PIDS}"; then
+      key="${ppid}"
+    else
+      continue
+    fi
+    # At most two per recorded pid: the wrapper and its job.
+    [ "$(grep -F -x -c -e "${key}" "${done_list}")" -lt 2 ] || continue
+    /bin/rm -f "${f}" && n=$((n + 1)) && echo "${key}" >>"${done_list}"
+  done
+  if [ "${n}" -gt 0 ]; then
+    printf 'crash reports: removed %d that this run caused\n' "${n}"
+  fi
+}
+
+#######################################
+# Kills any job process a test left behind, removes the crash reports the
+# run caused and removes the temp tree.
 #######################################
 cleanup() {
   local pid
   for pid in ${leftover_pids}; do
     kill -KILL "${pid}" 2>/dev/null
   done
+  remove_own_crash_reports
   /bin/rm -rf "${TMP_ROOT}"
 }
 trap cleanup EXIT
@@ -93,13 +157,34 @@ EOF
 #######################################
 # Starts a fresh case: a new temp HOME with ~/Library/Logs (as on macOS).
 # Globals:
-#   CASE_DIR, CASE_HOME
+#   CASE_DIR, CASE_HOME, CASE_LOG, CASE_CALLS, CASE_STATE
 #######################################
 new_case() {
   case_n=$((case_n + 1))
   CASE_DIR="${TMP_ROOT}/case${case_n}"
   CASE_HOME="${CASE_DIR}/home"
+  CASE_LOG="${CASE_HOME}/Library/Logs/launchd-run.log"
+  CASE_CALLS="${CASE_DIR}/osascript.calls"
+  CASE_STATE="${CASE_HOME}/.local/state/launchd-run"
   mkdir -p "${CASE_HOME}/Library/Logs"
+}
+
+#######################################
+# Sets WRAP_ENV to the env command every run of the wrapper in the current
+# case starts with: the case's HOME, the stub osascript first on PATH, where
+# the stub records its calls and how it exits, and the pinned version. Every
+# launcher builds on this one list, so a change to it reaches them all.
+# Globals:
+#   WRAP_ENV (set); CASE_HOME, CASE_DIR, OSASCRIPT_EXIT (read)
+# Arguments:
+#   A directory to put first on PATH, if any.
+#######################################
+wrap_env() {
+  WRAP_ENV=(env "HOME=${CASE_HOME}"
+    "PATH=${1:+$1:}${STUB_BIN}:${SYS_PATH}"
+    "OSASCRIPT_CALLS=${CASE_CALLS}"
+    "OSASCRIPT_EXIT=${OSASCRIPT_EXIT:-0}"
+    "REPO_VERSION=${TEST_VERSION}")
 }
 
 #######################################
@@ -112,17 +197,48 @@ new_case() {
 #   Wrapper stdout and stderr go to $CASE_DIR/out and $CASE_DIR/err.
 #######################################
 run_wrap() {
-  env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    OSASCRIPT_EXIT="${OSASCRIPT_EXIT:-0}" REPO_VERSION="${TEST_VERSION}" \
-    "${WRAPPER}" "$@" >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
+  wrap_env
+  "${WRAP_ENV[@]}" "${WRAPPER}" "$@" >"${CASE_DIR}/out" 2>"${CASE_DIR}/err"
   RC=$?
 }
 
 #######################################
-# Like run_wrap, but through perl's system(), which (unlike the shell's $?)
-# tells a process killed by signal N from one that exited 128+N, as launchd
-# does. Runs in $CASE_DIR, so a job's core or stackdump lands there.
+# Runs a command in $CASE_DIR, so a job's core or stackdump lands there,
+# through a perl launcher that (unlike the shell's $?) tells a process killed
+# by signal N from one that exited 128+N, as launchd does. The launcher adds
+# the command's pid to $CRASH_PIDS before waiting for it.
+# Globals:
+#   RC (set to the exit status, or 128+N when killed by signal N)
+#   KILLED_BY (set to the signal number that killed the command, or 0)
+# Arguments:
+#   The command and its arguments.
+# Outputs:
+#   The command's stdout and stderr go to $CASE_DIR/out and $CASE_DIR/err.
+#######################################
+raw_run() {
+  # shellcheck disable=SC2016  # $f, $p, $s and the rest belong to perl.
+  (cd "${CASE_DIR}" \
+    && /usr/bin/perl -e 'my ($f, $pf) = splice(@ARGV, 0, 2);
+        my $p = fork();
+        defined($p) or die;
+        if ($p == 0) { exec { $ARGV[0] } @ARGV; exit 127; }
+        open(my $h, ">>", $pf) or die;
+        print $h "$p\n";
+        close($h);
+        waitpid($p, 0);
+        my $s = $?;
+        open($h, ">", $f) or die;
+        print $h ($s & 127);
+        close($h);
+        exit(($s & 127) ? 128 + ($s & 127) : $s >> 8)' \
+      "${CASE_DIR}/killed-by" "${CRASH_PIDS}" "$@" \
+      >"${CASE_DIR}/out" 2>"${CASE_DIR}/err")
+  RC=$?
+  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+}
+
+#######################################
+# Like run_wrap, but through raw_run.
 # Globals:
 #   RC (set to the exit status, or 128+N when killed by signal N)
 #   KILLED_BY (set to the signal number that killed the wrapper, or 0)
@@ -130,25 +246,15 @@ run_wrap() {
 #   Arguments for launchd-run.sh.
 #######################################
 run_wrap_raw() {
-  # shellcheck disable=SC2016  # $? and $f belong to perl.
-  (cd "${CASE_DIR}" \
-    && env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-      OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-      REPO_VERSION="${TEST_VERSION}" \
-      /usr/bin/perl -e 'my $f = shift; system(@ARGV);
-        open(my $h, ">", $f) or die; print $h ($? & 127);
-        exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' \
-      "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
-      >"${CASE_DIR}/out" 2>"${CASE_DIR}/err")
-  RC=$?
-  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+  wrap_env
+  raw_run "${WRAP_ENV[@]}" "${WRAPPER}" "$@"
 }
 
 #######################################
 # Path of a label's fail counter in the current case.
 #######################################
 counter_file() {
-  printf '%s' "${CASE_HOME}/.local/state/launchd-run/$1/fail-count"
+  printf '%s' "${CASE_STATE}/$1/fail-count"
 }
 
 #######################################
@@ -157,7 +263,7 @@ counter_file() {
 #   Label, contents.
 #######################################
 seed_counter() {
-  mkdir -p "${CASE_HOME}/.local/state/launchd-run/$1"
+  mkdir -p "${CASE_STATE}/$1"
   printf '%s' "$2" >"$(counter_file "$1")"
 }
 
@@ -174,42 +280,40 @@ counter_is() {
 
 counter_absent() { [ ! -e "$(counter_file "$1")" ]; }
 
-calls() {
-  local f="${CASE_DIR}/osascript.calls"
-  if [ -f "${f}" ]; then
-    wc -l <"${f}" | tr -d ' '
+# Lines in a file, 0 if it is missing.
+file_lines() {
+  if [ -f "$1" ]; then
+    wc -l <"$1" | tr -d ' '
   else
     echo 0
   fi
 }
 
-calls_are() { [ "$(calls)" -eq "$1" ]; }
-
-# Line N of the osascript record contains the fixed string.
-call_has() {
-  local n="$1" want="$2" line
-  line="$(sed -n "${n}p" "${CASE_DIR}/osascript.calls" 2>/dev/null)"
+# Line N of a file contains the fixed string (false if the file is missing).
+file_line_has() {
+  local line
+  line="$(sed -n "$2p" "$1" 2>/dev/null)"
   case "${line}" in
-    *"${want}"*) return 0 ;;
+    *"$3"*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+calls() { file_lines "${CASE_CALLS}"; }
+
+calls_are() { [ "$(calls)" -eq "$1" ]; }
+
+# Line N of the osascript record contains the fixed string.
+call_has() { file_line_has "${CASE_CALLS}" "$1" "$2"; }
+
 audit_has() {
-  grep -F -q -- "$1" "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
+  grep -F -q -- "$1" "${CASE_LOG}" 2>/dev/null
 }
 
 audit_lacks() { ! audit_has "$1"; }
 
 # Line N of the audit log contains the fixed string.
-audit_line_has() {
-  local line
-  line="$(sed -n "$1p" "${CASE_HOME}/Library/Logs/launchd-run.log")"
-  case "${line}" in
-    *"$2"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+audit_line_has() { file_line_has "${CASE_LOG}" "$1" "$2"; }
 
 # Nothing but the audit log sits in ~/Library/Logs (no temp file left over).
 logs_dir_has_only_audit() {
@@ -224,40 +328,48 @@ seed_audit_lines() {
     for (i = 1; i <= n; i++) {
       printf "2026-01-01 00:00:00  seed%-34s line %05d\n", "", i
     }
-  }' >"${CASE_HOME}/Library/Logs/launchd-run.log"
+  }' >"${CASE_LOG}"
 }
 
-audit_lines_are() {
-  local f="${CASE_HOME}/Library/Logs/launchd-run.log" n=0
-  [ -f "${f}" ] && n="$(wc -l <"${f}" | tr -d ' ')"
-  [ "${n}" -eq "$1" ]
-}
+audit_lines_are() { [ "$(file_lines "${CASE_LOG}")" -eq "$1" ]; }
 
 err_has() { grep -F -q -- "$1" "${CASE_DIR}/err"; }
 err_empty() { [ ! -s "${CASE_DIR}/err" ]; }
 out_is() { [ "$(cat "${CASE_DIR}/out")" = "$1" ]; }
 path_absent() { [ ! -e "$1" ]; }
-state_dir_absent() { [ ! -e "${CASE_HOME}/.local/state/launchd-run" ]; }
+readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+state_dir_absent() { [ ! -e "${CASE_STATE}" ]; }
+
+# Runs a command every 0.1 s until it succeeds, at most N + 1 times (so for
+# at least N tenths of a second), and returns its last status.
+poll_for() {
+  local tries="$1" i=0
+  shift
+  until "$@"; do
+    [ "${i}" -lt "${tries}" ] || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+
+# Start lines in the case's audit log, 0 if there is none.
+start_lines() {
+  local n
+  n="$(grep -F -c -- 'started: launchd-run' "${CASE_LOG}" 2>/dev/null)"
+  echo "${n:-0}"
+}
+
+start_lines_reach() { [ "$(start_lines)" -ge "$1" ]; }
+
+file_not_empty() { [ -s "$1" ]; }
+pid_alive() { kill -0 "$1" 2>/dev/null; }
+pid_dead() { ! pid_alive "$1"; }
 
 # Polls (bash 3.2 has no wait -n) until a file exists, for up to ~5 s.
-wait_for_file() {
-  local i=0
-  while [ ! -s "$1" ] && [ "${i}" -lt 50 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ -s "$1" ]
-}
+wait_for_file() { poll_for 50 file_not_empty "$1"; }
 
 # Polls until a pid is gone, for up to ~3 s.
-pid_gone() {
-  local i=0
-  while kill -0 "$1" 2>/dev/null && [ "${i}" -lt 30 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  ! kill -0 "$1" 2>/dev/null
-}
+pid_gone() { poll_for 30 pid_dead "$1"; }
 
 # --- Cases. ------------------------------------------------------------------
 
@@ -476,7 +588,7 @@ test_stop_signals() {
   new_case
   seed_counter svc 2
   if ! stop_wrapper_with TERM \
-    "trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & wait \$!"; then
+    "trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & ready; wait \$!"; then
     check 'stop at threshold: wrapper started the job' false
   else
     check 'stop at threshold: streak of 2 preserved' counter_is svc 2
@@ -539,27 +651,11 @@ test_crash_signals() {
 
 test_bad_counter_file() {
   local content
-  echo '# empty counter file'
-  new_case
-  seed_counter job ''
-  run_wrap job -- /usr/bin/true
-  check 'empty counter, ok: exit 0' rc_is 0
-  check 'empty counter, ok: counter removed' counter_absent job
-  check 'empty counter, ok: no banner' calls_are 0
-  check 'empty counter, ok: no error noise' err_empty
-
-  new_case
-  seed_counter job ''
-  run_wrap job -- /bin/sh -c 'exit 3'
-  check 'empty counter, fail: exit 3' rc_is 3
-  check 'empty counter, fail: counter restarts at 1' counter_is job 1
-  check 'empty counter, fail: no banner' calls_are 0
-  check 'empty counter, fail: no error noise' err_empty
-
-  # A word would read as an unset variable in $(( )), a bad number would fail
-  # the expansion, and 08 would be rejected as octal; all must read as 0.
-  echo '# garbage counter file'
-  for content in garbage 12abc 08 -1; do
+  # An empty file holds no number, a word would read as an unset variable in
+  # $(( )), a bad number would fail the expansion, and 08 would be rejected
+  # as octal; all must read as 0.
+  echo '# empty and garbage counter files'
+  for content in '' garbage 12abc 08 -1; do
     new_case
     seed_counter job "${content}"
     run_wrap job -- /usr/bin/true
@@ -573,6 +669,8 @@ test_bad_counter_file() {
     run_wrap job -- /bin/sh -c 'exit 3'
     check "counter '${content}', fail: job exit 3 passed through" rc_is 3
     check "counter '${content}', fail: counter reset to 1" counter_is job 1
+    check "counter '${content}', fail: below threshold, no banner" \
+      calls_are 0
     check "counter '${content}', fail: FAILED audit line written" \
       audit_has 'FAILED exit 3'
     check "counter '${content}', fail: no error noise" err_empty
@@ -607,8 +705,8 @@ test_bad_counter_file() {
   echo '# fail count that cannot be cleared'
   new_case
   seed_counter job 2
-  chmod a-w "${CASE_HOME}/.local/state/launchd-run/job"
-  if : 2>/dev/null >"${CASE_HOME}/.local/state/launchd-run/job/probe"; then
+  chmod a-w "${CASE_STATE}/job"
+  if : 2>/dev/null >"${CASE_STATE}/job/probe"; then
     # Root, or a filesystem (Windows) that ignores directory permissions.
     printf 'skip        %s\n' 'uncleared count: directory is still writable'
   else
@@ -620,35 +718,44 @@ test_bad_counter_file() {
       audit_has 's) - cannot clear'
     check 'uncleared count, ok: no error on the job stderr' err_empty
   fi
-  chmod u+w "${CASE_HOME}/.local/state/launchd-run/job"
+  chmod u+w "${CASE_STATE}/job"
 }
 
 #######################################
-# Starts the wrapper in the background around a job that records its own
-# pid, then sends the wrapper the given signal once the job is up. This is
-# what launchctl kill, bootout, logout and a KeepAlive restart do: the
-# signal lands on the wrapper, not on the job.
+# Starts the wrapper in the background around a job, then sends the wrapper
+# the given signal once both are ready, with no fixed sleep: the wrapper has
+# written its start line, which it does only after its stop traps are set,
+# and the job has said it is ready, once its own traps are set. This is what
+# launchctl kill, bootout, logout and a KeepAlive restart do: the signal
+# lands on the wrapper, not on the job.
 # Globals:
 #   RC (set to the wrapper's exit status)
 #   CHILD (set to the job's pid, or empty if the job never started)
 # Arguments:
-#   Signal name, then the body of the job script (sh; $1 is the pid file).
+#   Signal name, then the body of the job script (sh). The body calls the
+#   script's "ready" function, which writes the job's pid to the pid file
+#   $1, once it is ready to be signalled.
+# Returns:
+#   1 (signalling nothing) if the job or the start line is not there within
+#   about 5 s.
 #######################################
 stop_wrapper_with() {
-  local sig="$1" body="$2" job pidfile wpid
+  local sig="$1" body="$2" job pidfile wpid starts
   job="${CASE_DIR}/job.sh"
   pidfile="${CASE_DIR}/child.pid"
   # shellcheck disable=SC2016  # Expanded by the job script, not here.
-  printf '#!/bin/sh\necho $$ >"$1"\n%s\n' "${body}" >"${job}"
+  printf '%s\n' '#!/bin/sh' 'pf="$1"' 'ready() { echo $$ >"${pf}"; }' \
+    "${body}" >"${job}"
   chmod +x "${job}"
+  # A case may stop the wrapper more than once: this run's start line is the
+  # one past those already in the log.
+  starts=$(($(start_lines) + 1))
 
   # env execs the wrapper, so $! is the wrapper's own bash. SIGINT is not
   # tested: a non-interactive shell starts async jobs with SIGINT ignored,
   # so the wrapper could neither receive nor trap it from here.
-  env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    REPO_VERSION="${TEST_VERSION}" \
-    "${WRAPPER}" svc -- "${job}" "${pidfile}" \
+  wrap_env
+  "${WRAP_ENV[@]}" "${WRAPPER}" svc -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
 
@@ -660,8 +767,14 @@ stop_wrapper_with() {
   fi
   CHILD="$(cat "${pidfile}")"
   leftover_pids="${leftover_pids} ${CHILD}"
-  # The job is up; give the wrapper a moment to reach its wait.
-  sleep 0.2
+  # The wrapper writes its start line once its stop traps are set and before
+  # it forks the job, so here it is normally there already. Waiting on it
+  # keeps the signal from going out early to a copy that writes it later.
+  if ! poll_for 50 start_lines_reach "${starts}"; then
+    kill -KILL "${wpid}" 2>/dev/null
+    { wait "${wpid}"; } 2>/dev/null
+    return 1
+  fi
 
   kill "-${sig}" "${wpid}"
   # The braces keep bash's "Terminated" job report out of the test output.
@@ -675,7 +788,7 @@ test_signal_to_wrapper() {
   for sig in TERM HUP; do
     new_case
     seed_counter svc 1
-    if ! stop_wrapper_with "${sig}" 'exec /bin/sleep 30'; then
+    if ! stop_wrapper_with "${sig}" 'ready; exec /bin/sleep 30'; then
       check "SIG${sig} to wrapper: wrapper started the job" false
       continue
     fi
@@ -695,7 +808,7 @@ test_signal_to_wrapper() {
   # sleep runs in the background so sh can act on the trap at once, and the
   # trap takes it down so the suite leaves nothing behind.
   if ! stop_wrapper_with TERM \
-    "trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & wait \$!"; then
+    "trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & ready; wait \$!"; then
     check 'clean stop: wrapper started the job' false
     return
   fi
@@ -714,7 +827,7 @@ test_stop_classified_by_wrapper() {
   echo '# #21: wrapper signalled, job exits 1 on SIGTERM: a stop, not counted'
   new_case
   seed_counter svc 1
-  body="trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & wait \$!"
+  body="trap 'kill \$!; exit 1' TERM; /bin/sleep 30 & ready; wait \$!"
   if ! stop_wrapper_with TERM "${body}"; then
     check '#21 exit 1 on stop: wrapper started the job' false
   else
@@ -736,7 +849,7 @@ test_stop_classified_by_wrapper() {
   echo '# #21: wrapper signalled, job exits 0 on SIGTERM: streak kept'
   new_case
   seed_counter svc 5
-  body="trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & wait \$!"
+  body="trap 'kill \$!; exit 0' TERM; /bin/sleep 30 & ready; wait \$!"
   if ! stop_wrapper_with TERM "${body}"; then
     check '#21 exit 0 on stop: wrapper started the job' false
     return
@@ -801,11 +914,11 @@ launchd_stop() {
   printf '#!/bin/sh\n%s\n' "${body}" >"${job}"
   chmod +x "${job}"
 
-  env HOME="${CASE_HOME}" PATH="${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    REPO_VERSION="${TEST_VERSION}" \
-    ${WRAPPER_SECONDS:+"SECONDS=${WRAPPER_SECONDS}"} \
-    "${WRAPPER}" svc "$@" -- "${job}" "${pidfile}" \
+  wrap_env
+  if [ -n "${WRAPPER_SECONDS}" ]; then
+    WRAP_ENV+=("SECONDS=${WRAPPER_SECONDS}")
+  fi
+  "${WRAP_ENV[@]}" "${WRAPPER}" svc "$@" -- "${job}" "${pidfile}" \
     >"${CASE_DIR}/out" 2>"${CASE_DIR}/err" &
   wpid=$!
 
@@ -855,7 +968,6 @@ stop_took_ms_at_most() { [ "${STOP_MS}" -le "$1" ]; }
 wrapper_killed() { [ "${WRAPPER_KILLED}" -eq 1 ]; }
 wrapper_not_killed() { [ "${WRAPPER_KILLED}" -eq 0 ]; }
 stop_took_at_least() { [ "${STOP_SECONDS}" -ge "$1" ]; }
-pid_alive() { kill -0 "$1" 2>/dev/null; }
 
 # Polls for up to ~3 s until no process is left sleeping for exactly $1
 # seconds. Any that remain are queued for cleanup.
@@ -1079,41 +1191,24 @@ LR_WPID=''
 LR_LAUNCHER=''
 
 # Polls until a file exists and is not empty, for up to ~20 s.
-lr_stop_wait_for() {
-  local i=0
-  while [ ! -s "$1" ] && [ "${i}" -lt 200 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ -s "$1" ]
-}
+lr_stop_wait_for() { poll_for 200 file_not_empty "$1"; }
 
 # Lines in a file, 0 if it is missing.
-lr_stop_lines() {
-  if [ -f "$1" ]; then
-    wc -l <"$1" | tr -d ' '
-  else
-    echo 0
-  fi
-}
+lr_stop_lines() { file_lines "$1"; }
+
+# A file holds at least N lines.
+lr_stop_lines_reach() { [ "$(file_lines "$1")" -ge "$2" ]; }
 
 # Polls until a file holds at least N lines, for up to ~20 s.
-lr_stop_wait_lines() {
-  local i=0
-  while [ "$(lr_stop_lines "$1")" -lt "$2" ] && [ "${i}" -lt 200 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ "$(lr_stop_lines "$1")" -ge "$2" ]
-}
+lr_stop_wait_lines() { poll_for 200 lr_stop_lines_reach "$1" "$2"; }
 
-lr_stop_lines_are() { [ "$(lr_stop_lines "$1")" -eq "$2" ]; }
+lr_stop_lines_are() { [ "$(file_lines "$1")" -eq "$2" ]; }
 lr_stop_file_is() { [ "$(cat "$1" 2>/dev/null)" = "$2" ]; }
 lr_stop_not_killed() { [ "${KILLED_BY}" = 0 ]; }
 # The wrapper exited with this status rather than being killed by a signal.
-lr_stop_exited_with() { [ "${KILLED_BY}" = 0 ] && rc_is "$1"; }
+lr_stop_exited_with() { lr_stop_not_killed && rc_is "$1"; }
 lr_stop_source_lacks() { ! grep -F -q -- "$1" "${WRAPPER}"; }
-lr_stop_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+lr_stop_readme_has() { readme_has "$1"; }
 
 #######################################
 # Writes the case's job script (sh). It is run with one argument, the pid
@@ -1177,12 +1272,11 @@ lr_stop_gate() {
 #######################################
 lr_stop_start() {
   /bin/rm -f "${CASE_DIR}/wrapper.pid" "${CASE_DIR}/killed-by"
+  wrap_env "${LR_PATH_PREFIX}"
+  WRAP_ENV+=("LR_G_DIR=${CASE_DIR}" "LR_G_CMD=${LR_GATE_CMD}"
+    "LR_G_ARG=${LR_GATE_ARG}")
   # shellcheck disable=SC2016  # $SIG, $p, $s and the rest belong to perl.
-  env HOME="${CASE_HOME}" \
-    PATH="${LR_PATH_PREFIX:+${LR_PATH_PREFIX}:}${STUB_BIN}:${SYS_PATH}" \
-    OSASCRIPT_CALLS="${CASE_DIR}/osascript.calls" \
-    REPO_VERSION="${TEST_VERSION}" LR_G_DIR="${CASE_DIR}" \
-    LR_G_CMD="${LR_GATE_CMD}" LR_G_ARG="${LR_GATE_ARG}" \
+  "${WRAP_ENV[@]}" \
     /usr/bin/perl -e '$SIG{INT} = $SIG{QUIT} = $SIG{PIPE} = "DEFAULT";
       my ($pf, $kf) = splice(@ARGV, 0, 2);
       my $p = fork();
@@ -1525,7 +1619,7 @@ lr_env_wrap() {
     *) cmd+=("HOME=${CASE_HOME}") ;;
   esac
   cmd+=("PATH=${LR_ENV_PATH:+${LR_ENV_PATH}:}${STUB_BIN}:${SYS_PATH}")
-  cmd+=("OSASCRIPT_CALLS=${CASE_DIR}/osascript.calls")
+  cmd+=("OSASCRIPT_CALLS=${CASE_CALLS}")
   if [ -n "${LR_ENV_VERSION}" ]; then
     cmd+=("REPO_VERSION=${LR_ENV_VERSION}")
   fi
@@ -1575,9 +1669,7 @@ lr_env_job_saw() {
 }
 
 # Lines on the wrapper's stderr.
-lr_env_err_lines_are() {
-  [ "$(wc -l <"${CASE_DIR}/err" | tr -d ' ')" -eq "$1" ]
-}
+lr_env_err_lines_are() { [ "$(file_lines "${CASE_DIR}/err")" -eq "$1" ]; }
 
 # The wrapper's stderr holds exactly one line, and it is not bash's own
 # complaint about an unset variable.
@@ -1591,12 +1683,12 @@ lr_env_ran_with() { [ -e "$1" ] && rc_is "$2"; }
 # Two start lines, the first not empty, are the same.
 lr_env_same_start() { [ -n "$1" ] && [ "$1" = "$2" ]; }
 
-lr_env_readme_has() { grep -F -q -- "$1" "${REPO}/README.md"; }
+lr_env_readme_has() { readme_has "$1"; }
 
 # The first audit line with its timestamp and label cut off.
 lr_env_start_line() {
   sed -n '1s/^.*started: /started: /p' \
-    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null
+    "${CASE_LOG}" 2>/dev/null
 }
 
 # Issue #23: a variable the caller set under a name the wrapper also uses
@@ -1808,7 +1900,7 @@ test_lr_env_30() {
 # --- lr-count: issues #45, #46, #48. -----------------------------------------
 
 # No audit log was written.
-lr_count_no_audit() { [ ! -e "${CASE_HOME}/Library/Logs/launchd-run.log" ]; }
+lr_count_no_audit() { path_absent "${CASE_LOG}"; }
 
 # One line of the wrapper's stderr contains both fixed strings.
 lr_count_err_line_has() {
@@ -1828,7 +1920,7 @@ lr_count_err_line_has() {
 # Exactly N osascript calls contain the fixed string.
 lr_count_calls_with() {
   local n
-  n="$(grep -F -c -- "$1" "${CASE_DIR}/osascript.calls" 2>/dev/null)"
+  n="$(grep -F -c -- "$1" "${CASE_CALLS}" 2>/dev/null)"
   [ "${n:-0}" -eq "$2" ]
 }
 
@@ -1837,7 +1929,7 @@ lr_count_calls_with() {
 lr_count_reset_noted() {
   local lines
   lines="$(grep -F -- 's) - cannot clear' \
-    "${CASE_HOME}/Library/Logs/launchd-run.log" 2>/dev/null)"
+    "${CASE_LOG}" 2>/dev/null)"
   [ -n "${lines}" ] || return 1
   grep -E -i -q 'reset[^0-9]*0([^0-9]|$)' <<<"${lines}"
 }
@@ -1965,7 +2057,7 @@ test_lr_count_48() {
   echo '# lr-count #48: an unremovable fail count is reset to 0'
   new_case
   seed_counter job 5
-  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  dir="${CASE_STATE}/job"
   chmod a-w "${dir}"
   if : 2>/dev/null >"${dir}/probe"; then
     printf 'skip        %s\n' 'lr-count: #48 directory is still writable'
@@ -1999,7 +2091,7 @@ test_lr_count_48() {
 
   new_case
   seed_counter job 1
-  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  dir="${CASE_STATE}/job"
   chmod a-w "${dir}"
   if : 2>/dev/null >"${dir}/probe"; then
     printf 'skip        %s\n' 'lr-count: #48 directory is still writable'
@@ -2014,7 +2106,7 @@ test_lr_count_48() {
   echo '# lr-count #48: a counter that can be neither removed nor written'
   new_case
   seed_counter job 5
-  dir="${CASE_HOME}/.local/state/launchd-run/job"
+  dir="${CASE_STATE}/job"
   chmod a-w "${dir}/fail-count" "${dir}"
   if : 2>/dev/null >>"${dir}/fail-count"; then
     printf 'skip        %s\n' 'lr-count: #48 counter is still writable'
