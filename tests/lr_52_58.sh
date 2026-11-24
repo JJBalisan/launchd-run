@@ -61,11 +61,27 @@ test_lr58_unwritable_log() {
   check 'lr-58: unwritable: still counted' counter_is svc 1
 }
 
+# A log past the trim size in a Logs directory that cannot be written to
+# (the log itself can): the trim fails without a word on the job's stderr,
+# and the run is still logged.
+test_lr58_trim_fails() {
+  echo '# lr-58: a trim that cannot write its temp file'
+  new_case
+  seed_audit_lines 250000 # about 17.1 MB, past the trim size
+  chmod 555 "${CASE_HOME}/Library/Logs"
+  run_wrap svc -- /usr/bin/true
+  chmod 755 "${CASE_HOME}/Library/Logs"
+  check 'lr-58: trim fails: exits 0' rc_is 0
+  check 'lr-58: trim fails: stderr empty' err_empty
+  check 'lr-58: trim fails: the run is logged' audit_lines_are 250002
+}
+
 main() {
   make_stubs
   echo "lr-52/58 checks (bash ${BASH_VERSION}) against ${WRAPPER}"
   test_lr58_missing_logs_dir
   test_lr58_unwritable_log
+  test_lr58_trim_fails
   printf '\n%d passed, %d failed\n' "${passes}" "${failures}"
   [ "${failures}" -eq 0 ]
 }
