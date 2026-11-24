@@ -42,9 +42,9 @@ launchd_run_job_env=(/usr/bin/env --
   ${launchd_run_job_env+"launchd_run_job_env=${launchd_run_job_env}"}
   ${launchd_run_name+"launchd_run_name=${launchd_run_name}"})
 for launchd_run_name in REPO_ROOT LIB LABEL AUDIT EX_USAGE AUDIT_MAX_BYTES \
-  AUDIT_KEEP_LINES AUDIT_WARNED alert_after kill_after state fails_file prev fails started \
-  pid stopped code elapsed sig killed woke deadline_done stop_pid told \
-  next_wait; do
+  AUDIT_KEEP_LINES AUDIT_WARNED alert_after kill_after state fails_file prev \
+  fails started pid stopped code elapsed sig killed woke deadline_done \
+  stop_pid told next_wait; do
   if [[ -n "${!launchd_run_name+x}" ]]; then
     launchd_run_job_env+=("${launchd_run_name}=${!launchd_run_name}")
   fi
