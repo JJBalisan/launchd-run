@@ -38,7 +38,15 @@ directly, with no audit line, no counter and no banner, and exits with the
 command's status. An empty `HOME` counts as none. Banners need a login session
 as well, so a job outside one never raises them.
 
+The audit line `alert sent` means only that `osascript` exited 0. The wrapper
+cannot tell that from a banner that was shown, and notifications turned off for
+Script Editor or a Focus mode may leave a failing job unseen. The audit log is
+the record to check; `alert FAILED` there means `osascript` exited non-zero.
+
 ## Install
+
+macOS 12.3 or later is required: the wrapper and `lib/version.sh` call
+`/usr/bin/readlink -f`.
 
 ```sh
 ./install.sh
@@ -74,9 +82,17 @@ Without it, two ordinary restarts look identical to two crashes.
 launchd stops a job by signalling its main process, which with the wrapper in
 front is the wrapper itself. The wrapper traps SIGHUP, SIGINT and SIGTERM,
 forwards SIGTERM to the command, waits for it to exit and then logs the stop
-(`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line and
-no orphaned command, provided the command exits on SIGTERM (the next section
-covers one that does not). A command that handles SIGTERM is logged as stopped
+(`stopped by signal`), so a `launchctl kickstart -k` leaves one audit line,
+provided the command exits on SIGTERM (the next section covers one that does
+not). The wrapper signals the command it started and nothing else. That
+command's own children are left to launchd, which sends SIGTERM to whatever
+remains in the process group once the wrapper has exited (`man launchd.plist`,
+under `AbandonProcessGroup`; on macOS 27.0.1 it was seen after launchd killed
+the wrapper, [#24](https://github.com/JJBalisan/launchd-run/issues/24)). That
+sweep does not happen when the plist sets `AbandonProcessGroup` or when the
+wrapper is run by hand, and a child that ignores SIGTERM survives it.
+`--kill-after` bounds the wait when the command itself is slow to exit. A
+command that handles SIGTERM is logged as stopped
 whatever code it exits with, 0 or 1 included. Further SIGHUP, SIGINT or
 SIGTERM during the shutdown are forwarded as SIGTERM again; the wrapper logs
 and exits only once the command has exited, with the command's own status.
@@ -168,11 +184,12 @@ goes with `<key>ExitTimeOut</key><integer>20</integer>` in the same plist.
 ## Log rotation
 
 The wrapper trims `~/Library/Logs/launchd-run.log` itself. Once the file passes
-1 MB (about 15,000 lines, some two years at the usual rate) it keeps the last
-5,000 lines: the trimmed copy is written beside the log and renamed over it, and
-the trim is noted in the log. A line another job appends during that rename can
-be lost, which is accepted for an audit trail of this kind. Nothing in
-`/etc/newsyslog.d` is needed.
+16 MB (16,777,216 bytes; about 200,000 lines, some two years at the usual rate
+of 84 bytes a line and 270 lines a day, measured on a live log in November
+2026) it keeps the last 100,000 lines, about a year: the trimmed copy is
+written beside the log and renamed over it, and the trim is noted in the log.
+A line another job appends during that rename can be lost, which is accepted
+for an audit trail of this kind. Nothing in `/etc/newsyslog.d` is needed.
 
 ## Releasing
 
@@ -225,3 +242,11 @@ wallpaper-setting job here hung exactly this way.
 
 `display notification` is a *different* permission class and is unaffected —
 this wrapper's own banners work fine from the same bash context.
+
+A job that signals its own process group is also affected. `kill 0` (or
+`kill -TERM 0`) reaches the wrapper, which shares the job's group: it takes
+the SIGTERM as a stop, logs `stopped by signal ... - not counted`, exits with
+the job's status, and neither counts the run nor raises a banner, so a run
+that then fails goes uncounted. `kill -- -$$` signals nothing under the
+wrapper: the job does not lead a group, so `kill` fails with "No such
+process", and the job's own children are not signalled either.

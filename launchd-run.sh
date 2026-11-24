@@ -63,9 +63,11 @@ LIB="$(dirname "$(/usr/bin/readlink -f "$0")")/lib/version.sh"
 readonly EX_USAGE=64
 
 # The audit log is trimmed to its last AUDIT_KEEP_LINES lines once it passes
-# AUDIT_MAX_BYTES: roughly 15,000 lines, or two years at the usual rate.
-readonly AUDIT_MAX_BYTES=1048576
-readonly AUDIT_KEEP_LINES=5000
+# AUDIT_MAX_BYTES. At about 84 bytes a line and 270 lines a day (measured on a
+# live log, November 2026) 16 MB is about 200,000 lines, two years of use, and
+# the 100,000 lines kept cover about one year.
+readonly AUDIT_MAX_BYTES=16777216
+readonly AUDIT_KEEP_LINES=100000
 
 # Set once the arguments are parsed; read by note() and notify().
 LABEL=''

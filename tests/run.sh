@@ -1038,24 +1038,25 @@ echo \$\$ >\"\$1\"; wait \$!"
 }
 
 test_log_rotation() {
-  echo '# audit log trimmed to its last 5000 lines once past 1 MB'
+  echo '# audit log trimmed to its last 100000 lines once past 16 MB'
   new_case
-  seed_audit_lines 20000 # about 1.2 MB
+  seed_audit_lines 250000 # about 17.1 MB, in 1048576-byte MB
   run_wrap job -- /usr/bin/true
   check 'rotation: exit 0' rc_is 0
-  check 'rotation: 5000 kept, plus the trim note and this run' \
-    audit_lines_are 5003
+  check 'rotation: 100000 kept, plus the trim note and this run' \
+    audit_lines_are 100003
   check 'rotation: the newest seed lines are the ones kept' \
-    audit_line_has 1 'line 15001'
-  check 'rotation: older lines gone' audit_lacks 'line 15000'
+    audit_line_has 1 'line 150001'
+  check 'rotation: older lines gone' audit_lacks 'line 150000'
   check 'rotation: trim recorded in the log' \
-    audit_line_has 5001 'audit log trimmed to the last 5000 lines'
+    audit_line_has 100001 'audit log trimmed to the last 100000 lines'
   check 'rotation: this run starts after the trim' \
-    audit_line_has 5002 "started: launchd-run ${TEST_VERSION}"
-  check 'rotation: this run logged after the trim' audit_line_has 5003 'ok ('
+    audit_line_has 100002 "started: launchd-run ${TEST_VERSION}"
+  check 'rotation: this run logged after the trim' \
+    audit_line_has 100003 'ok ('
   check 'rotation: no temp file left beside the log' logs_dir_has_only_audit
 
-  echo '# a log under 1 MB is left alone'
+  echo '# a log under 16 MB is left alone'
   new_case
   seed_audit_lines 100
   run_wrap job -- /usr/bin/true
