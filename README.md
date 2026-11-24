@@ -101,18 +101,24 @@ seen by the time it forks the command means the command is never run (the
 forked process checks for it before it execs the command): the wrapper logs
 `stopped by signal before the job started - not counted`, leaves the counter
 alone and exits with 128 plus the signal number. A stop after the fork is
-forwarded as SIGTERM, which ends the command whether or not it has been
+forwarded as SIGTERM, which reaches the command whether or not it has been
 exec'd yet, and is logged as any other stop. (If it lands in the first instant
 after the fork, bash 3.2 prints two `run_pending_traps` warnings on the
 command's stderr as it passes the SIGTERM on.)
 
-One instant is not covered. bash acts on a trapped signal only between
+Some stops are still lost. bash acts on a trapped signal only between
 commands, and the wrapper's `wait` is a command: a stop that lands after bash
 has looked for signals on its way into that `wait`, but before the `wait`
-blocks (a few instructions, read from the source of bash 3.2, the version
-launchd runs; not reproduced), is acted on only when the `wait` ends, which is
-when the command exits or another signal reaches the wrapper. Until then the
-command is not told, and a `--kill-after` deadline does not start.
+blocks (about a microsecond of bash 3.2's command set-up, but a loaded machine
+can stretch it), is acted on only when the `wait` ends, which is when the
+command exits or another signal reaches the wrapper. Until then the command is
+not told, and a `--kill-after` deadline does not start. Under `/bin/bash` 3.2,
+with SIGTERM sent 0 to 1.5 ms after the fork, 8 stops in 2,000 runs were lost
+on a loaded machine, most likely in this instant. In 3 of the 2,000 runs the
+wrapper itself died (twice of SIGSEGV inside bash's signal handling, once of
+SIGKILL), leaving the command running as an orphan with only the start line
+logged. A stop that lands before the traps are installed, while the wrapper
+is still starting up, kills the wrapper before it has started the command.
 
 Other signals sent to the wrapper do not end it either:
 
@@ -173,7 +179,7 @@ goes with `<key>ExitTimeOut</key><integer>20</integer>` in the same plist.
   ([#44](https://github.com/JJBalisan/launchd-run/issues/44)).
 - The deadline starts when the wrapper first sees the stop, wherever it is
   in its wait loop, and is not restarted by later signals. A stop that lands
-  in the one instant described above is seen only when that `wait` ends.
+  in the instant described above is seen only when that `wait` ends.
 
 ## Log rotation
 
