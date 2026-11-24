@@ -6,8 +6,18 @@
 #
 # Hermetic: every case gets its own temporary HOME (which holds both the
 # per-label fail counters and the audit log), and a stub osascript sits first
-# on PATH and records each call to a file instead of raising a banner. Nothing
-# outside the temp directory is written, and no network is used.
+# on PATH and records each call to a file instead of raising a banner. No
+# network is used, and the suite itself writes nothing outside the temp
+# directory, with one exception it cannot prevent: the crash-signal cases make
+# the wrapper's bash (and some jobs) really die of SIGSEGV, SIGBUS or SIGABRT,
+# since launchd's KeepAlive Crashed key depends on it, and macOS files a crash
+# report (bash-<date>.ips) in ~/Library/Logs/DiagnosticReports for such a
+# death, though it skips repeats in quick succession. No setting a shell can
+# reach turns that off for one process. So the launcher of those cases
+# records each pid it starts, and on exit the suite removes the reports that
+# were created during the run for one of those pids or its children, and
+# prints how many; it touches no other report. One filed after the suite has
+# exited stays. LAUNCHD_RUN_CRASH_REPORTS names another directory to look in.
 #
 # Assertions print "ok" or "FAIL".
 #
@@ -29,6 +39,15 @@ readonly TEST_VERSION='vTEST'
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/launchd-run-tests.XXXXXX")" || exit 2
 readonly TMP_ROOT
 readonly STUB_BIN="${TMP_ROOT}/bin"
+# One line per pid that raw_run started: the processes that may crash.
+readonly CRASH_PIDS="${TMP_ROOT}/crash.pids"
+CRASH_REPORTS="${LAUNCHD_RUN_CRASH_REPORTS:-}"
+if [ -z "${CRASH_REPORTS}" ] && [ -n "${HOME:-}" ]; then
+  CRASH_REPORTS="${HOME}/Library/Logs/DiagnosticReports"
+fi
+readonly CRASH_REPORTS
+# A report created before this second is not the run's.
+SUITE_START="$(date +%s)"
 
 passes=0
 failures=0
@@ -50,13 +69,42 @@ WRAP_ENV=()
 WRAPPER_SECONDS=''
 
 #######################################
-# Kills any job process a test left behind and removes the temp tree.
+# Removes the macOS crash reports this run caused (see the header): those in
+# $CRASH_REPORTS created since the run began whose process is one raw_run
+# started or a child of one, matched on the report's own pid fields. Removes
+# at most two per recorded pid (the wrapper and its job).
+# Outputs:
+#   How many it removed, if any.
+#######################################
+remove_own_crash_reports() {
+  local f pid ppid born max n=0
+  [ -s "${CRASH_PIDS}" ] && [ -d "${CRASH_REPORTS}" ] || return 0
+  max=$((2 * $(wc -l <"${CRASH_PIDS}")))
+  for f in "${CRASH_REPORTS}"/bash-*.ips "${CRASH_REPORTS}"/sh-*.ips; do
+    [ -f "${f}" ] && [ "${n}" -lt "${max}" ] || continue
+    born="$(/usr/bin/stat -f %B "${f}" 2>/dev/null)" || continue
+    [ "${born}" -ge "${SUITE_START}" ] || continue
+    pid="$(sed -n 's/^  "pid" : \([0-9][0-9]*\),$/\1/p' "${f}")"
+    ppid="$(sed -n 's/^  "parentPid" : \([0-9][0-9]*\),$/\1/p' "${f}")"
+    if grep -F -x -q -e "${pid:-x}" -e "${ppid:-x}" "${CRASH_PIDS}"; then
+      /bin/rm -f "${f}" && n=$((n + 1))
+    fi
+  done
+  if [ "${n}" -gt 0 ]; then
+    printf 'crash reports: removed %d that this run caused\n' "${n}"
+  fi
+}
+
+#######################################
+# Kills any job process a test left behind, removes the crash reports the
+# run caused and removes the temp tree.
 #######################################
 cleanup() {
   local pid
   for pid in ${leftover_pids}; do
     kill -KILL "${pid}" 2>/dev/null
   done
+  remove_own_crash_reports
   /bin/rm -rf "${TMP_ROOT}"
 }
 trap cleanup EXIT
@@ -146,9 +194,42 @@ run_wrap() {
 }
 
 #######################################
-# Like run_wrap, but through perl's system(), which (unlike the shell's $?)
-# tells a process killed by signal N from one that exited 128+N, as launchd
-# does. Runs in $CASE_DIR, so a job's core or stackdump lands there.
+# Runs a command in $CASE_DIR, so a job's core or stackdump lands there,
+# through a perl launcher that (unlike the shell's $?) tells a process killed
+# by signal N from one that exited 128+N, as launchd does. The launcher adds
+# the command's pid to $CRASH_PIDS before waiting for it.
+# Globals:
+#   RC (set to the exit status, or 128+N when killed by signal N)
+#   KILLED_BY (set to the signal number that killed the command, or 0)
+# Arguments:
+#   The command and its arguments.
+# Outputs:
+#   The command's stdout and stderr go to $CASE_DIR/out and $CASE_DIR/err.
+#######################################
+raw_run() {
+  # shellcheck disable=SC2016  # $f, $p, $s and the rest belong to perl.
+  (cd "${CASE_DIR}" \
+    && /usr/bin/perl -e 'my ($f, $pf) = splice(@ARGV, 0, 2);
+        my $p = fork();
+        defined($p) or die;
+        if ($p == 0) { exec { $ARGV[0] } @ARGV; exit 127; }
+        open(my $h, ">>", $pf) or die;
+        print $h "$p\n";
+        close($h);
+        waitpid($p, 0);
+        my $s = $?;
+        open($h, ">", $f) or die;
+        print $h ($s & 127);
+        close($h);
+        exit(($s & 127) ? 128 + ($s & 127) : $s >> 8)' \
+      "${CASE_DIR}/killed-by" "${CRASH_PIDS}" "$@" \
+      >"${CASE_DIR}/out" 2>"${CASE_DIR}/err")
+  RC=$?
+  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+}
+
+#######################################
+# Like run_wrap, but through raw_run.
 # Globals:
 #   RC (set to the exit status, or 128+N when killed by signal N)
 #   KILLED_BY (set to the signal number that killed the wrapper, or 0)
@@ -157,15 +238,7 @@ run_wrap() {
 #######################################
 run_wrap_raw() {
   wrap_env
-  # shellcheck disable=SC2016  # $? and $f belong to perl.
-  (cd "${CASE_DIR}" \
-    && "${WRAP_ENV[@]}" /usr/bin/perl -e 'my $f = shift; system(@ARGV);
-        open(my $h, ">", $f) or die; print $h ($? & 127);
-        exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' \
-      "${CASE_DIR}/killed-by" "${WRAPPER}" "$@" \
-      >"${CASE_DIR}/out" 2>"${CASE_DIR}/err")
-  RC=$?
-  KILLED_BY="$(cat "${CASE_DIR}/killed-by" 2>/dev/null)"
+  raw_run "${WRAP_ENV[@]}" "${WRAPPER}" "$@"
 }
 
 #######################################
