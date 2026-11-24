@@ -36,6 +36,7 @@ bash tests/lr_count_select_edges.sh
 bash tests/lr_docs_verify_rotation.sh
 bash tests/lr_docs_select_boundary.sh
 bash tests/lr_56_fix.sh
+bash tests/lr_52_58.sh
 bash tests/lr_restack_env.sh
 bash tests/ci_runner.sh
 
@@ -49,5 +50,6 @@ bash tests/ci_runner.sh
 /bin/bash tests/lr_docs_verify_rotation.sh
 /bin/bash tests/lr_docs_select_boundary.sh
 /bin/bash tests/lr_56_fix.sh
+/bin/bash tests/lr_52_58.sh
 /bin/bash tests/lr_restack_env.sh
 /bin/bash tests/ci_runner.sh
