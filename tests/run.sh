@@ -77,18 +77,27 @@ WRAPPER_SECONDS=''
 #   How many it removed, if any.
 #######################################
 remove_own_crash_reports() {
-  local f pid ppid born max n=0
+  local f pid ppid born key n=0
+  local done_list="${TMP_ROOT}/crash-removed"
   [ -s "${CRASH_PIDS}" ] && [ -d "${CRASH_REPORTS}" ] || return 0
-  max=$((2 * $(wc -l <"${CRASH_PIDS}")))
+  : >"${done_list}"
   for f in "${CRASH_REPORTS}"/bash-*.ips "${CRASH_REPORTS}"/sh-*.ips; do
-    [ -f "${f}" ] && [ "${n}" -lt "${max}" ] || continue
+    [ -f "${f}" ] || continue
     born="$(/usr/bin/stat -f %B "${f}" 2>/dev/null)" || continue
     [ "${born}" -ge "${SUITE_START}" ] || continue
     pid="$(sed -n 's/^  "pid" : \([0-9][0-9]*\),$/\1/p' "${f}")"
     ppid="$(sed -n 's/^  "parentPid" : \([0-9][0-9]*\),$/\1/p' "${f}")"
-    if grep -F -x -q -e "${pid:-x}" -e "${ppid:-x}" "${CRASH_PIDS}"; then
-      /bin/rm -f "${f}" && n=$((n + 1))
+    # The recorded pid this report belongs to: its own, or its parent's.
+    if [ -n "${pid}" ] && grep -F -x -q -e "${pid}" "${CRASH_PIDS}"; then
+      key="${pid}"
+    elif [ -n "${ppid}" ] && grep -F -x -q -e "${ppid}" "${CRASH_PIDS}"; then
+      key="${ppid}"
+    else
+      continue
     fi
+    # At most two per recorded pid: the wrapper and its job.
+    [ "$(grep -F -x -c -e "${key}" "${done_list}")" -lt 2 ] || continue
+    /bin/rm -f "${f}" && n=$((n + 1)) && echo "${key}" >>"${done_list}"
   done
   if [ "${n}" -gt 0 ]; then
     printf 'crash reports: removed %d that this run caused\n' "${n}"
